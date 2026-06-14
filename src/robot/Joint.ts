@@ -14,6 +14,7 @@ export class Joint {
     readonly name: string,
     axis: Vector3,
     readonly limit: JointLimit,
+    private readonly bodyRadius = 0.105,
   ) {
     this.axis = axis.clone().normalize();
     this.group.name = name;
@@ -36,7 +37,7 @@ export class Joint {
   }
 
   private createJointBody(): Mesh {
-    const geometry = new SphereGeometry(0.105, 32, 18);
+    const geometry = new SphereGeometry(this.bodyRadius, 32, 18);
     const material = new MeshStandardMaterial({
       color: 0x25313d,
       metalness: 0.55,

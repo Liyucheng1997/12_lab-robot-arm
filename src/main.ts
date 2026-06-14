@@ -9,7 +9,6 @@ import {
   Raycaster,
   Vector2,
   Vector3,
-  WebGLRenderer,
 } from 'three';
 import { createCamera } from './scene/camera';
 import { createControls } from './scene/controls';
@@ -20,7 +19,13 @@ import { createDefaultTrajectory, JointTrajectoryPlayer } from './robot/trajecto
 import type { JointWaypoint } from './types/robot';
 import type { IKResult } from './types/robot';
 import { computeVisualChainState, forwardKinematics, forwardKinematicsDH, solveIK } from './robot/kinematics';
-import { checkGroundClearance, checkTrajectoryGroundClearance } from './robot/collision';
+import {
+  checkGroundClearance,
+  checkObstacleCollision,
+  checkSelfCollision,
+  checkTrajectoryGroundClearance,
+  checkTrajectoryObstacleCollision,
+} from './robot/collision';
 import { GRIPPER_GRASP_OFFSET, HOME_POSE, ZERO_POSE } from './robot/limits';
 import { createRobotGui, type RobotGuiApi } from './ui/gui';
 import { createAxes } from './utils/axes';
@@ -44,6 +49,9 @@ const PICK_DURATION_SECONDS = 3.2;
 const PLACE_DURATION_SECONDS = 3.8;
 const PLANNED_TRAJECTORY_SAMPLES = 96;
 const SAFE_HOME_TIME_SECONDS = 1.25;
+const VISION_PREVIEW_INTERVAL_SECONDS = 0.12;
+const VISION_PREVIEW_WIDTH = 320;
+const VISION_PREVIEW_HEIGHT = 240;
 
 interface PlannedSortTrajectory {
   ball: SortableBall;
@@ -95,7 +103,9 @@ let executionPhase: ExecutionPhase = 'idle';
 let carriedBall: SortableBall | null = null;
 let operationStatus = 'select a ball';
 let latestDetections: VisionDetection[] = [];
+let latestOnlineDetections: VisionDetection[] = [];
 let selectedVisionDetection: VisionDetection | null = null;
+let visionPreviewElapsed = VISION_PREVIEW_INTERVAL_SECONDS;
 
 const vision = new OfflineVisionSystem(() => station.getBalls());
 scene.add(vision.group);
@@ -128,9 +138,9 @@ const autoController = new AutoSortController(autoDeps);
 const visionPanel = document.createElement('div');
 visionPanel.className = 'vision-panel';
 visionPanel.innerHTML = [
-  '<strong>Overhead Vision Camera</strong>',
+  '<strong>Online Detection Output</strong>',
   '<div class="vision-preview"></div>',
-  '<div class="vision-caption">Top-down camera stream with detected ball poses</div>',
+  '<div class="vision-caption">Live HSV segmentation | ball color + centroid only</div>',
   '<div class="vision-table"></div>',
 ].join('');
 app.appendChild(visionPanel);
@@ -141,10 +151,12 @@ if (!visionPreview || !visionTable) {
 }
 const visionTableElement = visionTable;
 
-const visionPreviewRenderer = new WebGLRenderer({ antialias: true, alpha: false });
-visionPreviewRenderer.setSize(320, 240);
-visionPreviewRenderer.setPixelRatio(1);
-visionPreview.appendChild(visionPreviewRenderer.domElement);
+const visionDetectionCanvas = document.createElement('canvas');
+visionDetectionCanvas.width = VISION_PREVIEW_WIDTH;
+visionDetectionCanvas.height = VISION_PREVIEW_HEIGHT;
+visionDetectionCanvas.className = 'vision-detection-canvas';
+visionPreview.appendChild(visionDetectionCanvas);
+const visionDetectionContext = getCanvas2DContext(visionDetectionCanvas);
 
 const hud = document.createElement('div');
 hud.className = 'hud';
@@ -260,9 +272,9 @@ function animate(): void {
   player.update(delta);
   autoController.tick();
   controls.update();
+  updateDetectionPreview(delta);
   updateHud();
   updateVisionPanel();
-  renderVisionPreview();
   renderer.render(scene, camera);
 }
 
@@ -415,10 +427,29 @@ function findNearestBall(worldPosition: Vector3): SortableBall | null {
 function planSortTrajectoryForTarget(target: SortPlanTarget, source: 'manual' | 'vision'): void {
   const toolOffset = vectorFromTuple(GRIPPER_GRASP_OFFSET);
   const startAngles = robot.getJointAngles();
+  const binObstacles = station.getBinObstacles();
 
-  const safePrePickResult = solveGroundSafeIK(target.prePickPosition, startAngles, toolOffset, 0.02);
+  const pickTransitResult = solveGroundSafeIK(
+    target.pickTransitPosition,
+    startAngles,
+    toolOffset,
+    0.025,
+    binObstacles,
+  );
+  if (!pickTransitResult || (!pickTransitResult.success && pickTransitResult.error > 0.08)) {
+    failPlanning('pick transit unreachable without ground/bin collision');
+    return;
+  }
+
+  const safePrePickResult = solveGroundSafeIK(
+    target.prePickPosition,
+    pickTransitResult.jointAngles,
+    toolOffset,
+    0.02,
+    binObstacles,
+  );
   if (!safePrePickResult || (!safePrePickResult.success && safePrePickResult.error > 0.08)) {
-    failPlanning('pre-pick unreachable without ground collision');
+    failPlanning('pre-pick unreachable without ground/bin collision');
     return;
   }
 
@@ -427,21 +458,46 @@ function planSortTrajectoryForTarget(target: SortPlanTarget, source: 'manual' | 
     safePrePickResult.jointAngles,
     toolOffset,
     0.014,
+    binObstacles,
   );
   if (!pickResult || (!pickResult.success && pickResult.error > GRASP_ATTACH_TOLERANCE)) {
-    failPlanning('pick unreachable without ground collision');
+    failPlanning('pick unreachable without ground/bin collision');
     return;
   }
 
-  const liftResult = solveGroundSafeIK(target.liftPosition, pickResult.jointAngles, toolOffset, 0.02);
+  const liftResult = solveGroundSafeIK(
+    target.liftPosition,
+    pickResult.jointAngles,
+    toolOffset,
+    0.02,
+    binObstacles,
+  );
   if (!liftResult || (!liftResult.success && liftResult.error > 0.08)) {
-    failPlanning('lift unreachable without ground collision');
+    failPlanning('lift unreachable without ground/bin collision');
     return;
   }
 
-  const dropResult = solveGroundSafeIK(target.dropPosition, liftResult.jointAngles, toolOffset, 0.025);
+  const placeTransitResult = solveGroundSafeIK(
+    target.placeTransitPosition,
+    liftResult.jointAngles,
+    toolOffset,
+    0.025,
+    binObstacles,
+  );
+  if (!placeTransitResult || (!placeTransitResult.success && placeTransitResult.error > 0.08)) {
+    failPlanning('place transit unreachable without ground/bin collision');
+    return;
+  }
+
+  const dropResult = solveGroundSafeIK(
+    target.dropPosition,
+    placeTransitResult.jointAngles,
+    toolOffset,
+    0.025,
+    binObstacles,
+  );
   if (!dropResult || (!dropResult.success && dropResult.error > 0.1)) {
-    failPlanning('drop unreachable without ground collision');
+    failPlanning('drop unreachable without ground/bin collision');
     return;
   }
 
@@ -450,22 +506,26 @@ function planSortTrajectoryForTarget(target: SortPlanTarget, source: 'manual' | 
     pickPosition: target.pickPosition.clone(),
     pickWaypoints: [
       { time: 0, jointAngles: startAngles },
-      { time: PICK_DURATION_SECONDS * 0.68, jointAngles: safePrePickResult.jointAngles },
+      { time: PICK_DURATION_SECONDS * 0.42, jointAngles: pickTransitResult.jointAngles },
+      { time: PICK_DURATION_SECONDS * 0.76, jointAngles: safePrePickResult.jointAngles },
       { time: PICK_DURATION_SECONDS, jointAngles: pickResult.jointAngles },
     ],
     placeWaypoints: [
       { time: 0, jointAngles: pickResult.jointAngles },
-      { time: PLACE_DURATION_SECONDS * 0.35, jointAngles: liftResult.jointAngles },
+      { time: PLACE_DURATION_SECONDS * 0.28, jointAngles: liftResult.jointAngles },
+      { time: PLACE_DURATION_SECONDS * 0.68, jointAngles: placeTransitResult.jointAngles },
       { time: PLACE_DURATION_SECONDS, jointAngles: dropResult.jointAngles },
     ],
   };
   plannedSortTrajectory.pickWaypoints = findGroundSafeWaypointRoute(
     plannedSortTrajectory.pickWaypoints,
     toolOffset,
+    binObstacles,
   );
   plannedSortTrajectory.placeWaypoints = findGroundSafeWaypointRoute(
     plannedSortTrajectory.placeWaypoints,
     toolOffset,
+    binObstacles,
   );
   const pickClearance = checkTrajectoryGroundClearance(
     plannedSortTrajectory.pickWaypoints,
@@ -478,6 +538,23 @@ function planSortTrajectoryForTarget(target: SortPlanTarget, source: 'manual' | 
   if (!pickClearance.safe || !placeClearance.safe) {
     const minY = Math.min(pickClearance.minY, placeClearance.minY);
     failPlanning(`ground collision minY=${minY.toFixed(3)}m`);
+    return;
+  }
+  const pickObstacle = checkTrajectoryObstacleCollision(
+    plannedSortTrajectory.pickWaypoints,
+    binObstacles,
+    toolOffset,
+  );
+  const placeObstacle = checkTrajectoryObstacleCollision(
+    plannedSortTrajectory.placeWaypoints,
+    binObstacles,
+    toolOffset,
+  );
+  if (!pickObstacle.safe || !placeObstacle.safe) {
+    const collision = !pickObstacle.safe ? pickObstacle : placeObstacle;
+    failPlanning(
+      `bin collision ${collision.obstacleName ?? 'obstacle'} clearance=${collision.minClearance.toFixed(3)}m`,
+    );
     return;
   }
   const minClearanceY = Math.min(pickClearance.minY, placeClearance.minY);
@@ -502,10 +579,12 @@ function solveGroundSafeIK(
   currentAngles: number[],
   toolOffset: Vector3,
   threshold: number,
+  obstacles = station.getBinObstacles(),
 ): IKResult | null {
   const seeds = createGroundSafeIkSeeds(currentAngles, targetPosition);
   let bestSafeResult: IKResult | null = null;
   let bestUnsafeMinY = Number.POSITIVE_INFINITY;
+  let bestUnsafeObstacleClearance = Number.POSITIVE_INFINITY;
 
   seeds.forEach((seed) => {
     const result = solveIK({ position: targetPosition }, seed, {
@@ -519,6 +598,14 @@ function solveGroundSafeIK(
       bestUnsafeMinY = Math.min(bestUnsafeMinY, clearance.minY);
       return;
     }
+    if (!checkSelfCollision(result.jointAngles, toolOffset).safe) {
+      return;
+    }
+    const obstacle = checkObstacleCollision(result.jointAngles, obstacles, toolOffset);
+    if (!obstacle.safe) {
+      bestUnsafeObstacleClearance = Math.min(bestUnsafeObstacleClearance, obstacle.minClearance);
+      return;
+    }
     if (!bestSafeResult || result.error < bestSafeResult.error) {
       bestSafeResult = result;
     }
@@ -526,6 +613,11 @@ function solveGroundSafeIK(
 
   if (!bestSafeResult && Number.isFinite(bestUnsafeMinY)) {
     logger.warn(`All IK candidates collide with ground; best minY=${bestUnsafeMinY.toFixed(3)}m`);
+  }
+  if (!bestSafeResult && Number.isFinite(bestUnsafeObstacleClearance)) {
+    logger.warn(
+      `All IK candidates collide with bins; best clearance=${bestUnsafeObstacleClearance.toFixed(3)}m`,
+    );
   }
   return bestSafeResult;
 }
@@ -571,9 +663,14 @@ function dedupeSeeds(seeds: number[][]): number[][] {
   return [...new Map(seeds.map((seed) => [seed.map((value) => value.toFixed(3)).join(','), seed])).values()];
 }
 
-function findGroundSafeWaypointRoute(waypoints: JointWaypoint[], toolOffset: Vector3): JointWaypoint[] {
+function findGroundSafeWaypointRoute(
+  waypoints: JointWaypoint[],
+  toolOffset: Vector3,
+  obstacles = station.getBinObstacles(),
+): JointWaypoint[] {
   const directClearance = checkTrajectoryGroundClearance(waypoints, toolOffset);
-  if (directClearance.safe) {
+  const directObstacle = checkTrajectoryObstacleCollision(waypoints, obstacles, toolOffset);
+  if (directClearance.safe && directObstacle.safe) {
     return waypoints;
   }
 
@@ -587,7 +684,8 @@ function findGroundSafeWaypointRoute(waypoints: JointWaypoint[], toolOffset: Vec
     })),
   ];
   const homeClearance = checkTrajectoryGroundClearance(viaHome, toolOffset);
-  if (homeClearance.safe) {
+  const homeObstacle = checkTrajectoryObstacleCollision(viaHome, obstacles, toolOffset);
+  if (homeClearance.safe && homeObstacle.safe) {
     return viaHome;
   }
 
@@ -600,14 +698,19 @@ function findGroundSafeWaypointRoute(waypoints: JointWaypoint[], toolOffset: Vec
     })),
   ];
   const liftedClearance = checkTrajectoryGroundClearance(viaLiftedStart, toolOffset);
-  if (liftedClearance.safe) {
+  const liftedObstacle = checkTrajectoryObstacleCollision(viaLiftedStart, obstacles, toolOffset);
+  if (liftedClearance.safe && liftedObstacle.safe) {
     return viaLiftedStart;
   }
 
   logger.warn(
-    `No ground-safe route found; direct minY=${directClearance.minY.toFixed(3)}m, home minY=${homeClearance.minY.toFixed(
+    `No collision-safe route found; direct minY=${directClearance.minY.toFixed(
       3,
-    )}m, lifted minY=${liftedClearance.minY.toFixed(3)}m`,
+    )}m bin=${directObstacle.minClearance.toFixed(3)}m, home minY=${homeClearance.minY.toFixed(
+      3,
+    )}m bin=${homeObstacle.minClearance.toFixed(3)}m, lifted minY=${liftedClearance.minY.toFixed(
+      3,
+    )}m bin=${liftedObstacle.minClearance.toFixed(3)}m`,
   );
   return waypoints;
 }
@@ -789,18 +892,19 @@ function formatVisionStatus(): string {
   if (!selectedVisionDetection) {
     return `${latestDetections.length} detections`;
   }
-  return `${latestDetections.length} detections, ${selectedVisionDetection.ballId} px=${selectedVisionDetection.pixel.x.toFixed(
+  const detectionLabel = selectedVisionDetection.ballId ?? selectedVisionDetection.color;
+  return `${latestDetections.length} detections, ${detectionLabel} px=${selectedVisionDetection.pixel.x.toFixed(
     0,
   )},${selectedVisionDetection.pixel.y.toFixed(0)} conf=${selectedVisionDetection.confidence.toFixed(2)}`;
 }
 
 function updateVisionPanel(): void {
-  const rows = latestDetections
+  const rows = latestOnlineDetections
     .slice(0, 10)
     .map(
-      (detection) =>
-        `<div class="vision-row ${detection.ballId === selectedVisionDetection?.ballId ? 'active' : ''}">
-          <span>${detection.ballId}</span>
+      (detection, index) =>
+        `<div class="vision-row ${detection === selectedVisionDetection ? 'active' : ''}">
+          <span>D${index + 1}</span>
           <span>${detection.color}</span>
           <span>${detection.pixel.x.toFixed(0)},${detection.pixel.y.toFixed(0)}</span>
           <span>${formatVector(detection.estimatedWorldPosition, 2)}</span>
@@ -809,15 +913,88 @@ function updateVisionPanel(): void {
     .join('');
   visionTableElement.innerHTML = [
     '<div class="vision-head"><span>ID</span><span>Color</span><span>Pixel</span><span>World</span></div>',
-    rows || '<div class="vision-empty">Run detection</div>',
+    rows || '<div class="vision-empty">No balls detected in the live frame</div>',
   ].join('');
 }
 
-function renderVisionPreview(): void {
-  const previousVisibility = vision.group.visible;
-  vision.group.visible = false;
-  visionPreviewRenderer.render(scene, vision.camera);
-  vision.group.visible = previousVisibility;
+function updateDetectionPreview(deltaSeconds: number): void {
+  visionPreviewElapsed += deltaSeconds;
+  if (visionPreviewElapsed < VISION_PREVIEW_INTERVAL_SECONDS) {
+    return;
+  }
+  visionPreviewElapsed = 0;
+
+  const frame = onlineVision.observe();
+  latestOnlineDetections = frame.isObservable ? onlineVision.detectVisibleBalls(frame) : [];
+  if (visionMode === 'online') {
+    latestDetections = latestOnlineDetections;
+    selectedVisionDetection = latestOnlineDetections[0] ?? null;
+  }
+
+  const context = visionDetectionContext;
+  const width = visionDetectionCanvas.width;
+  const height = visionDetectionCanvas.height;
+  context.clearRect(0, 0, width, height);
+  context.fillStyle = '#05090c';
+  context.fillRect(0, 0, width, height);
+
+  context.strokeStyle = 'rgba(111, 143, 157, 0.12)';
+  context.lineWidth = 1;
+  for (let x = 0; x <= width; x += 40) {
+    context.beginPath();
+    context.moveTo(x + 0.5, 0);
+    context.lineTo(x + 0.5, height);
+    context.stroke();
+  }
+  for (let y = 0; y <= height; y += 40) {
+    context.beginPath();
+    context.moveTo(0, y + 0.5);
+    context.lineTo(width, y + 0.5);
+    context.stroke();
+  }
+
+  latestOnlineDetections.forEach((detection) => {
+    const x = (detection.pixel.x / frame.width) * width;
+    const y = (1 - detection.pixel.y / frame.height) * height;
+    const pixelScale = (width / frame.width + height / frame.height) / 2;
+    const radius = Math.max(6, Math.min(18, Math.sqrt(detection.areaPx / Math.PI) * pixelScale));
+    const color = detection.color === 'red' ? '#ff3f4b' : '#337cff';
+
+    context.fillStyle = color;
+    context.globalAlpha = 0.82;
+    context.beginPath();
+    context.arc(x, y, radius, 0, Math.PI * 2);
+    context.fill();
+
+    context.globalAlpha = 1;
+    context.strokeStyle = '#ffffff';
+    context.lineWidth = 1.5;
+    context.beginPath();
+    context.arc(x, y, 4.5, 0, Math.PI * 2);
+    context.moveTo(x - 8, y);
+    context.lineTo(x + 8, y);
+    context.moveTo(x, y - 8);
+    context.lineTo(x, y + 8);
+    context.stroke();
+    context.fillStyle = '#ffffff';
+    context.fillRect(x - 1, y - 1, 2, 2);
+  });
+
+  context.fillStyle = frame.isObservable ? '#65e6a5' : '#ff7272';
+  context.font = '600 11px system-ui, sans-serif';
+  context.fillText(
+    frame.isObservable ? `LIVE ONLINE | ${latestOnlineDetections.length} DETECTED` : 'CAMERA VIEW BLOCKED',
+    10,
+    17,
+  );
+}
+
+function getCanvas2DContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
+  const context = canvas.getContext('2d');
+  if (!context) {
+    throw new Error('Unable to create vision detection canvas');
+  }
+  return context;
 }
 
 function formatQuaternion(quaternion: Quaternion): string {

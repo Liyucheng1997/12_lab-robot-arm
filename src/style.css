@@ -69,8 +69,13 @@ canvas {
 }
 
 .vision-preview canvas {
+  display: block;
   width: 100%;
   height: 100%;
+}
+
+.vision-detection-canvas {
+  image-rendering: pixelated;
 }
 
 .vision-caption {

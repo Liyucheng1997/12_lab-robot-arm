@@ -44,6 +44,8 @@ export interface JointRuntimeConfig {
   offsetToNext: [number, number, number];
   limit: JointLimit;
   linkRadius: number;
+  /** Radius of the spherical joint housing. Must be small enough that adjacent housings do not overlap. */
+  bodyRadius: number;
   linkColor: number;
 }
 

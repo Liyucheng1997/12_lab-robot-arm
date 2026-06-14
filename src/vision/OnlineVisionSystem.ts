@@ -15,25 +15,35 @@ import {
 } from 'three';
 import type { BallColor } from '../sorting/SortingStation';
 import type { VisionDetection, VisionFrame, VisionSystem } from './VisionSystem';
+import { configureStationVisionCamera } from './cameraConfig';
 import { detectBlobs, usablePixelRatio } from './imageProcessing';
 
 const CAPTURE_WIDTH = 240;
 const CAPTURE_HEIGHT = 180;
-/** Approximate height of a ball center resting in the staging bin (floor 0.16 + radius). */
-const BALL_PLANE_Y = 0.22;
+/** Approximate height of a ball center resting on the staging-bin floor. */
+const BALL_PLANE_Y = 0.24;
 /** Below this lit-pixel ratio the view is treated as obstructed/unreadable (FR-008). */
 const OBSERVABLE_RATIO_FLOOR = 0.1;
-/** Arm pick region; back-projected blobs outside it (e.g. the destination bins) are ignored. */
+interface DetectionRegion {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+}
+
+/** Only balls in the gray source bin are actionable by the sorting controller. */
 const PICK_REGION = { minX: 0.85, maxX: 1.62, minZ: -0.45, maxZ: 0.45 };
+/** The operator preview tracks balls across the source and both destination bins. */
+const STATION_REGION = { minX: 0.78, maxX: 1.68, minZ: -1.08, maxZ: 1.08 };
 
 /**
- * Genuine online recognition: renders the overhead camera to an offscreen target,
+ * Genuine online recognition: renders the fixed front camera to an offscreen target,
  * reads the pixels back, and recovers ball color + position from the image alone.
  * It never reads ball world positions or colors (see contracts/vision-system.md VS-1).
  */
 export class OnlineVisionSystem implements VisionSystem {
   readonly mode = 'online' as const;
-  readonly camera = new PerspectiveCamera(42, CAPTURE_WIDTH / CAPTURE_HEIGHT, 0.05, 8);
+  readonly camera = new PerspectiveCamera(50, CAPTURE_WIDTH / CAPTURE_HEIGHT, 0.05, 8);
   readonly group = new Group();
   /** Scene objects (other vision rigs, overlays) hidden while capturing the frame. */
   hideDuringCapture: Object3D[] = [];
@@ -47,11 +57,8 @@ export class OnlineVisionSystem implements VisionSystem {
     private readonly renderer: WebGLRenderer,
     private readonly scene: Scene,
   ) {
-    this.camera.name = 'Online overhead vision camera';
-    this.camera.position.set(1.2, 3.05, 0);
-    this.camera.lookAt(1.2, 0.18, 0);
-    this.camera.updateMatrixWorld(true);
-    this.camera.updateProjectionMatrix();
+    this.camera.name = 'Online front vision camera';
+    configureStationVisionCamera(this.camera);
 
     this.detectionMarkers.name = 'Online vision detection markers';
     this.group.name = 'Online vision';
@@ -90,6 +97,14 @@ export class OnlineVisionSystem implements VisionSystem {
   }
 
   detectBalls(frame: VisionFrame): VisionDetection[] {
+    return this.detectInRegion(frame, PICK_REGION);
+  }
+
+  detectVisibleBalls(frame: VisionFrame): VisionDetection[] {
+    return this.detectInRegion(frame, STATION_REGION);
+  }
+
+  private detectInRegion(frame: VisionFrame, region: DetectionRegion): VisionDetection[] {
     this.detectionMarkers.clear();
     const blobs = detectBlobs(frame.pixels, frame.width, frame.height);
     const detections: VisionDetection[] = [];
@@ -100,10 +115,10 @@ export class OnlineVisionSystem implements VisionSystem {
       const ndcY = (blob.centroidY / frame.height) * 2 - 1;
       const world = this.backProject(ndcX, ndcY);
       if (
-        world.x < PICK_REGION.minX ||
-        world.x > PICK_REGION.maxX ||
-        world.z < PICK_REGION.minZ ||
-        world.z > PICK_REGION.maxZ
+        world.x < region.minX ||
+        world.x > region.maxX ||
+        world.z < region.minZ ||
+        world.z > region.maxZ
       ) {
         return;
       }

@@ -125,7 +125,13 @@ export class RobotArm {
     let parent: Group = this.group;
 
     DEFAULT_JOINT_CONFIGS.forEach((config, index) => {
-      const joint = new Joint(index, config.name, vectorFromTuple(config.axis), config.limit);
+      const joint = new Joint(
+        index,
+        config.name,
+        vectorFromTuple(config.axis),
+        config.limit,
+        config.bodyRadius,
+      );
       if (index === 0) {
         joint.group.position.set(...ROBOT_BASE_OFFSET);
       } else {

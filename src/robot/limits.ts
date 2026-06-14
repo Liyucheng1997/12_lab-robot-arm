@@ -21,7 +21,7 @@ export const HOME_POSE = [
 
 export const ZERO_POSE = [0, 0, 0, 0, 0, 0];
 
-export const ROBOT_BASE_OFFSET: [number, number, number] = [0, 0.18, 0];
+export const ROBOT_BASE_OFFSET: [number, number, number] = [-0.28, 0.18, -0.21];
 
 export const TOOL_OFFSET: [number, number, number] = [0.28, 0, 0];
 
@@ -34,6 +34,7 @@ export const DEFAULT_JOINT_CONFIGS: JointRuntimeConfig[] = [
     offsetToNext: [0, 0.72, 0],
     limit: DEFAULT_JOINT_LIMITS[0],
     linkRadius: 0.16,
+    bodyRadius: 0.18,
     linkColor: 0x5f6b7a,
   },
   {
@@ -42,6 +43,7 @@ export const DEFAULT_JOINT_CONFIGS: JointRuntimeConfig[] = [
     offsetToNext: [0.92, 0, 0],
     limit: DEFAULT_JOINT_LIMITS[1],
     linkRadius: 0.12,
+    bodyRadius: 0.16,
     linkColor: 0xd2dde9,
   },
   {
@@ -50,6 +52,7 @@ export const DEFAULT_JOINT_CONFIGS: JointRuntimeConfig[] = [
     offsetToNext: [0.72, 0, 0],
     limit: DEFAULT_JOINT_LIMITS[2],
     linkRadius: 0.1,
+    bodyRadius: 0.13,
     linkColor: 0xb9c7d7,
   },
   {
@@ -58,6 +61,7 @@ export const DEFAULT_JOINT_CONFIGS: JointRuntimeConfig[] = [
     offsetToNext: [0.28, 0, 0],
     limit: DEFAULT_JOINT_LIMITS[3],
     linkRadius: 0.075,
+    bodyRadius: 0.105,
     linkColor: 0x8797aa,
   },
   {
@@ -66,6 +70,7 @@ export const DEFAULT_JOINT_CONFIGS: JointRuntimeConfig[] = [
     offsetToNext: [0.2, 0, 0],
     limit: DEFAULT_JOINT_LIMITS[4],
     linkRadius: 0.06,
+    bodyRadius: 0.085,
     linkColor: 0xaebdcd,
   },
   {
@@ -74,6 +79,7 @@ export const DEFAULT_JOINT_CONFIGS: JointRuntimeConfig[] = [
     offsetToNext: TOOL_OFFSET,
     limit: DEFAULT_JOINT_LIMITS[5],
     linkRadius: 0.045,
+    bodyRadius: 0.07,
     linkColor: 0x95a5b7,
   },
 ];

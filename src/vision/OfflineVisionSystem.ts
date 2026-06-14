@@ -14,12 +14,17 @@ import {
 } from 'three';
 import type { BallColor, SortableBall } from '../sorting/SortingStation';
 import type { VisionDetection, VisionFrame, VisionSystem } from './VisionSystem';
+import {
+  configureStationVisionCamera,
+  VISION_CAMERA_POSITION,
+  VISION_CAMERA_TARGET,
+} from './cameraConfig';
 
 export type { VisionDetection } from './VisionSystem';
 
 export class OfflineVisionSystem implements VisionSystem {
   readonly mode = 'offline' as const;
-  readonly camera = new PerspectiveCamera(42, 4 / 3, 0.05, 8);
+  readonly camera = new PerspectiveCamera(50, 4 / 3, 0.05, 8);
   readonly group = new Group();
   readonly imageSize = new Vector2(320, 240);
 
@@ -27,11 +32,8 @@ export class OfflineVisionSystem implements VisionSystem {
   private readonly detectionMarkers = new Group();
 
   constructor(private readonly getBalls: () => readonly SortableBall[]) {
-    this.camera.name = 'Fixed overhead vision camera';
-    this.camera.position.set(1.2, 3.05, 0);
-    this.camera.lookAt(1.2, 0.18, 0);
-    this.camera.updateMatrixWorld(true);
-    this.camera.updateProjectionMatrix();
+    this.camera.name = 'Fixed front vision camera';
+    configureStationVisionCamera(this.camera);
 
     const helper = new CameraHelper(this.camera);
     helper.name = 'Vision camera frustum';
@@ -124,7 +126,7 @@ export class OfflineVisionSystem implements VisionSystem {
 
   private createCameraRig(): Group {
     const rig = new Group();
-    rig.name = 'Visible overhead vision camera rig';
+    rig.name = 'Visible front vision camera rig';
 
     const supportMaterial = new MeshStandardMaterial({
       color: 0x2f3a42,
@@ -144,43 +146,41 @@ export class OfflineVisionSystem implements VisionSystem {
       roughness: 0.18,
     });
 
-    const mastHeight = 2.82;
+    const mastHeight = VISION_CAMERA_POSITION.y + 0.2;
     const mast = new Mesh(new CylinderGeometry(0.026, 0.026, mastHeight, 18), supportMaterial);
     mast.name = 'Vision camera mast';
-    mast.position.set(0.55, mastHeight / 2, -0.62);
+    mast.position.set(VISION_CAMERA_POSITION.x + 0.24, mastHeight / 2, VISION_CAMERA_POSITION.z);
     mast.castShadow = true;
     rig.add(mast);
 
-    const boomLength = this.camera.position.x - mast.position.x;
+    const boomLength = 0.24;
     const boom = new Mesh(new BoxGeometry(boomLength, 0.045, 0.055), supportMaterial);
     boom.name = 'Vision camera boom';
-    boom.position.set(mast.position.x + boomLength / 2, 2.78, -0.62);
+    boom.position.set(VISION_CAMERA_POSITION.x + boomLength / 2, VISION_CAMERA_POSITION.y, VISION_CAMERA_POSITION.z);
     boom.castShadow = true;
     rig.add(boom);
 
-    const drop = new Mesh(new CylinderGeometry(0.018, 0.018, 0.62, 16), supportMaterial);
-    drop.name = 'Vision camera drop bracket';
-    drop.position.set(this.camera.position.x, 2.48, -0.62);
-    drop.castShadow = true;
-    rig.add(drop);
-
+    const cameraMount = new Group();
+    cameraMount.position.copy(VISION_CAMERA_POSITION);
+    cameraMount.lookAt(VISION_CAMERA_TARGET);
     const cameraBody = new Mesh(new BoxGeometry(0.36, 0.18, 0.28), bodyMaterial);
-    cameraBody.name = 'Fixed overhead vision camera body';
-    cameraBody.position.set(this.camera.position.x, 2.17, -0.62);
+    cameraBody.name = 'Fixed front vision camera body';
     cameraBody.castShadow = true;
-    rig.add(cameraBody);
+    cameraMount.add(cameraBody);
 
-    const sensorFace = new Mesh(new BoxGeometry(0.22, 0.018, 0.16), lensMaterial);
-    sensorFace.name = 'Fixed overhead vision camera sensor face';
-    sensorFace.position.set(this.camera.position.x, 2.068, -0.62);
+    const sensorFace = new Mesh(new BoxGeometry(0.22, 0.16, 0.018), lensMaterial);
+    sensorFace.name = 'Fixed front vision camera sensor face';
+    sensorFace.position.z = -0.15;
     sensorFace.castShadow = true;
-    rig.add(sensorFace);
+    cameraMount.add(sensorFace);
 
     const lens = new Mesh(new CylinderGeometry(0.072, 0.09, 0.105, 28), lensMaterial);
-    lens.name = 'Fixed overhead vision camera lens';
-    lens.position.set(this.camera.position.x, 2.0, -0.62);
+    lens.name = 'Fixed front vision camera lens';
+    lens.rotation.x = Math.PI / 2;
+    lens.position.z = -0.21;
     lens.castShadow = true;
-    rig.add(lens);
+    cameraMount.add(lens);
+    rig.add(cameraMount);
 
     return rig;
   }

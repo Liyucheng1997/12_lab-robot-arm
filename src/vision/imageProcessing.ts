@@ -31,6 +31,12 @@ export const DEFAULT_BLOB_OPTIONS: BlobOptions = {
   minValue: 0.2,
 };
 
+interface ComponentPixel {
+  x: number;
+  y: number;
+  purity: number;
+}
+
 /** Convert 0..255 RGB to HSV with h in [0,360), s and v in [0,1]. */
 export function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
   const rn = r / 255;
@@ -123,9 +129,7 @@ export function detectBlobs(
     }
 
     let area = 0;
-    let sumX = 0;
-    let sumY = 0;
-    let sumPurity = 0;
+    const componentPixels: ComponentPixel[] = [];
     stack.length = 0;
     stack.push(start);
     labels[start] = blobs.length;
@@ -135,10 +139,8 @@ export function detectBlobs(
       const x = index % width;
       const y = Math.floor(index / width);
       area += 1;
-      sumX += x;
-      sumY += y;
       const [h, s, v] = rgbToHsv(pixels[index * 4], pixels[index * 4 + 1], pixels[index * 4 + 2]);
-      sumPurity += pixelPurity(h, s, v, startColor);
+      componentPixels.push({ x, y, purity: pixelPurity(h, s, v, startColor) });
 
       pushNeighbor(stack, labels, pixels, options, startColor, x - 1, y, width, height, blobs.length);
       pushNeighbor(stack, labels, pixels, options, startColor, x + 1, y, width, height, blobs.length);
@@ -149,16 +151,88 @@ export function detectBlobs(
     if (area < options.minArea) {
       continue;
     }
-    blobs.push({
-      color: startColor,
-      centroidX: sumX / area,
-      centroidY: sumY / area,
-      areaPx: area,
-      confidence: clamp01(sumPurity / area),
-    });
+    blobs.push(...splitElongatedComponent(componentPixels, startColor, options.minArea));
   }
 
   return blobs.sort((left, right) => right.confidence - left.confidence);
+}
+
+/**
+ * Touching balls of the same color form one component. Their union is elongated,
+ * so split it along its PCA major axis into approximately circular sub-components.
+ */
+function splitElongatedComponent(
+  pixels: ComponentPixel[],
+  color: 'red' | 'blue',
+  minArea: number,
+): BlobDetection[] {
+  const meanX = pixels.reduce((sum, pixel) => sum + pixel.x, 0) / pixels.length;
+  const meanY = pixels.reduce((sum, pixel) => sum + pixel.y, 0) / pixels.length;
+  let covarianceXX = 0;
+  let covarianceYY = 0;
+  let covarianceXY = 0;
+
+  pixels.forEach((pixel) => {
+    const dx = pixel.x - meanX;
+    const dy = pixel.y - meanY;
+    covarianceXX += dx * dx;
+    covarianceYY += dy * dy;
+    covarianceXY += dx * dy;
+  });
+
+  const angle = 0.5 * Math.atan2(2 * covarianceXY, covarianceXX - covarianceYY);
+  const majorX = Math.cos(angle);
+  const majorY = Math.sin(angle);
+  const minorX = -majorY;
+  const minorY = majorX;
+  let minMajor = Number.POSITIVE_INFINITY;
+  let maxMajor = Number.NEGATIVE_INFINITY;
+  let minMinor = Number.POSITIVE_INFINITY;
+  let maxMinor = Number.NEGATIVE_INFINITY;
+
+  const projected = pixels.map((pixel) => {
+    const dx = pixel.x - meanX;
+    const dy = pixel.y - meanY;
+    const major = dx * majorX + dy * majorY;
+    const minor = dx * minorX + dy * minorY;
+    minMajor = Math.min(minMajor, major);
+    maxMajor = Math.max(maxMajor, major);
+    minMinor = Math.min(minMinor, minor);
+    maxMinor = Math.max(maxMinor, minor);
+    return { ...pixel, major };
+  });
+
+  const majorExtent = maxMajor - minMajor + 1;
+  const minorExtent = maxMinor - minMinor + 1;
+  const splitCount = Math.min(
+    10,
+    Math.max(1, Math.round(majorExtent / Math.max(minorExtent, 1))),
+  );
+  if (splitCount === 1 || pixels.length < splitCount * minArea) {
+    return [createBlob(pixels, color)];
+  }
+
+  const buckets = Array.from({ length: splitCount }, () => [] as ComponentPixel[]);
+  projected.forEach((pixel) => {
+    const normalized = (pixel.major - minMajor) / Math.max(maxMajor - minMajor, 1);
+    const bucketIndex = Math.min(splitCount - 1, Math.floor(normalized * splitCount));
+    buckets[bucketIndex].push(pixel);
+  });
+  if (buckets.some((bucket) => bucket.length < minArea)) {
+    return [createBlob(pixels, color)];
+  }
+  return buckets.map((bucket) => createBlob(bucket, color));
+}
+
+function createBlob(pixels: ComponentPixel[], color: 'red' | 'blue'): BlobDetection {
+  const areaPx = pixels.length;
+  return {
+    color,
+    centroidX: pixels.reduce((sum, pixel) => sum + pixel.x, 0) / areaPx,
+    centroidY: pixels.reduce((sum, pixel) => sum + pixel.y, 0) / areaPx,
+    areaPx,
+    confidence: clamp01(pixels.reduce((sum, pixel) => sum + pixel.purity, 0) / areaPx),
+  };
 }
 
 function pushNeighbor(

@@ -1,6 +1,7 @@
 import * as CANNON from 'cannon-es';
 import {
   BoxGeometry,
+  Box3,
   Color,
   Group,
   Mesh,
@@ -19,6 +20,7 @@ interface BinConfig {
   color: BinColor;
   center: Vector3;
   visualColor: number;
+  wallHeight: number;
 }
 
 export interface SortableBall {
@@ -32,18 +34,29 @@ export interface SortableBall {
 export interface SortPlanTarget {
   ball: SortableBall;
   pickPosition: Vector3;
+  pickTransitPosition: Vector3;
   prePickPosition: Vector3;
   liftPosition: Vector3;
+  placeTransitPosition: Vector3;
   dropPosition: Vector3;
+}
+
+export interface CollisionBox {
+  name: string;
+  box: Box3;
 }
 
 const BALL_RADIUS = 0.055;
 const BIN_SIZE = new Vector3(0.62, 0.18, 0.62);
 const WALL_THICKNESS = 0.035;
+const SOURCE_BIN_WALL_HEIGHT = 0.07;
+const TARGET_BIN_WALL_HEIGHT = 0.08;
 const BIN_FLOOR_Y = 0.16;
+const PICK_TRANSIT_Y = 1.02;
+const PLACE_TRANSIT_Y = 1.12;
 const PRE_PICK_CLEARANCE = 0.22;
-const LIFT_CLEARANCE = 0.42;
-const DROP_CLEARANCE = 0.58;
+const LIFT_CLEARANCE = 0.32;
+const DROP_CLEARANCE = 0.78;
 
 export class SortingStation {
   readonly group = new Group();
@@ -53,6 +66,7 @@ export class SortingStation {
 
   private readonly balls: SortableBall[] = [];
   private readonly bins = new Map<BinColor, BinConfig>();
+  private readonly binObstacles: CollisionBox[] = [];
   private readonly selectionMarker: Mesh;
   private selectedBall: SortableBall | null = null;
 
@@ -96,6 +110,13 @@ export class SortingStation {
 
   getBalls(): readonly SortableBall[] {
     return this.balls;
+  }
+
+  getBinObstacles(): CollisionBox[] {
+    return this.binObstacles.map((obstacle) => ({
+      name: obstacle.name,
+      box: obstacle.box.clone(),
+    }));
   }
 
   getBallById(id: string): SortableBall | null {
@@ -152,8 +173,10 @@ export class SortingStation {
     return {
       ball,
       pickPosition,
+      pickTransitPosition: new Vector3(pickPosition.x, PICK_TRANSIT_Y, pickPosition.z),
       prePickPosition: pickPosition.clone().add(new Vector3(0, PRE_PICK_CLEARANCE, 0)),
       liftPosition: pickPosition.clone().add(new Vector3(0, LIFT_CLEARANCE, 0)),
+      placeTransitPosition: new Vector3(targetBin.center.x, PLACE_TRANSIT_Y, targetBin.center.z),
       dropPosition: targetBin.center.clone().add(new Vector3(0, DROP_CLEARANCE, 0)),
     };
   }
@@ -197,9 +220,24 @@ export class SortingStation {
 
   private createBins(): void {
     const configs: BinConfig[] = [
-      { color: 'red', center: new Vector3(1.18, BIN_FLOOR_Y, -0.72), visualColor: 0xc83232 },
-      { color: 'white', center: new Vector3(1.22, BIN_FLOOR_Y, 0), visualColor: 0xe8edf2 },
-      { color: 'blue', center: new Vector3(1.18, BIN_FLOOR_Y, 0.72), visualColor: 0x2f6fff },
+      {
+        color: 'red',
+        center: new Vector3(1.18, BIN_FLOOR_Y, -0.72),
+        visualColor: 0x8c7474,
+        wallHeight: TARGET_BIN_WALL_HEIGHT,
+      },
+      {
+        color: 'white',
+        center: new Vector3(1.22, BIN_FLOOR_Y, 0),
+        visualColor: 0xe8edf2,
+        wallHeight: SOURCE_BIN_WALL_HEIGHT,
+      },
+      {
+        color: 'blue',
+        center: new Vector3(1.18, BIN_FLOOR_Y, 0.72),
+        visualColor: 0x747c8c,
+        wallHeight: TARGET_BIN_WALL_HEIGHT,
+      },
     ];
 
     configs.forEach((config) => {
@@ -225,34 +263,34 @@ export class SortingStation {
     floor.position.y = config.center.y;
     bin.add(floor);
 
-    const leftWall = this.createBoxMesh(BIN_SIZE.x, BIN_SIZE.y, WALL_THICKNESS, material);
+    const leftWall = this.createBoxMesh(BIN_SIZE.x, config.wallHeight, WALL_THICKNESS, material);
     leftWall.position.set(
       config.center.x,
-      config.center.y + BIN_SIZE.y * 0.5,
+      config.center.y + config.wallHeight * 0.5,
       config.center.z - BIN_SIZE.z * 0.5,
     );
     bin.add(leftWall);
 
-    const rightWall = this.createBoxMesh(BIN_SIZE.x, BIN_SIZE.y, WALL_THICKNESS, material);
+    const rightWall = this.createBoxMesh(BIN_SIZE.x, config.wallHeight, WALL_THICKNESS, material);
     rightWall.position.set(
       config.center.x,
-      config.center.y + BIN_SIZE.y * 0.5,
+      config.center.y + config.wallHeight * 0.5,
       config.center.z + BIN_SIZE.z * 0.5,
     );
     bin.add(rightWall);
 
-    const frontWall = this.createBoxMesh(WALL_THICKNESS, BIN_SIZE.y, BIN_SIZE.z, material);
+    const frontWall = this.createBoxMesh(WALL_THICKNESS, config.wallHeight, BIN_SIZE.z, material);
     frontWall.position.set(
       config.center.x + BIN_SIZE.x * 0.5,
-      config.center.y + BIN_SIZE.y * 0.5,
+      config.center.y + config.wallHeight * 0.5,
       config.center.z,
     );
     bin.add(frontWall);
 
-    const rearWall = this.createBoxMesh(WALL_THICKNESS, BIN_SIZE.y, BIN_SIZE.z, material);
+    const rearWall = this.createBoxMesh(WALL_THICKNESS, config.wallHeight, BIN_SIZE.z, material);
     rearWall.position.set(
       config.center.x - BIN_SIZE.x * 0.5,
-      config.center.y + BIN_SIZE.y * 0.5,
+      config.center.y + config.wallHeight * 0.5,
       config.center.z,
     );
     bin.add(rearWall);
@@ -260,26 +298,39 @@ export class SortingStation {
   }
 
   private addBinPhysics(config: BinConfig): void {
-    this.addStaticBox(
+    this.addBinObstacle(
+      `${config.color} bin floor`,
       new Vector3(config.center.x, config.center.y, config.center.z),
       new Vector3(BIN_SIZE.x, WALL_THICKNESS, BIN_SIZE.z),
     );
-    this.addStaticBox(
-      new Vector3(config.center.x, config.center.y + BIN_SIZE.y * 0.5, config.center.z - BIN_SIZE.z * 0.5),
-      new Vector3(BIN_SIZE.x, BIN_SIZE.y, WALL_THICKNESS),
+    this.addBinObstacle(
+      `${config.color} bin left wall`,
+      new Vector3(config.center.x, config.center.y + config.wallHeight * 0.5, config.center.z - BIN_SIZE.z * 0.5),
+      new Vector3(BIN_SIZE.x, config.wallHeight, WALL_THICKNESS),
     );
-    this.addStaticBox(
-      new Vector3(config.center.x, config.center.y + BIN_SIZE.y * 0.5, config.center.z + BIN_SIZE.z * 0.5),
-      new Vector3(BIN_SIZE.x, BIN_SIZE.y, WALL_THICKNESS),
+    this.addBinObstacle(
+      `${config.color} bin right wall`,
+      new Vector3(config.center.x, config.center.y + config.wallHeight * 0.5, config.center.z + BIN_SIZE.z * 0.5),
+      new Vector3(BIN_SIZE.x, config.wallHeight, WALL_THICKNESS),
     );
-    this.addStaticBox(
-      new Vector3(config.center.x + BIN_SIZE.x * 0.5, config.center.y + BIN_SIZE.y * 0.5, config.center.z),
-      new Vector3(WALL_THICKNESS, BIN_SIZE.y, BIN_SIZE.z),
+    this.addBinObstacle(
+      `${config.color} bin front wall`,
+      new Vector3(config.center.x + BIN_SIZE.x * 0.5, config.center.y + config.wallHeight * 0.5, config.center.z),
+      new Vector3(WALL_THICKNESS, config.wallHeight, BIN_SIZE.z),
     );
-    this.addStaticBox(
-      new Vector3(config.center.x - BIN_SIZE.x * 0.5, config.center.y + BIN_SIZE.y * 0.5, config.center.z),
-      new Vector3(WALL_THICKNESS, BIN_SIZE.y, BIN_SIZE.z),
+    this.addBinObstacle(
+      `${config.color} bin rear wall`,
+      new Vector3(config.center.x - BIN_SIZE.x * 0.5, config.center.y + config.wallHeight * 0.5, config.center.z),
+      new Vector3(WALL_THICKNESS, config.wallHeight, BIN_SIZE.z),
     );
+  }
+
+  private addBinObstacle(name: string, position: Vector3, size: Vector3): void {
+    this.addStaticBox(position, size);
+    this.binObstacles.push({
+      name,
+      box: new Box3().setFromCenterAndSize(position, size),
+    });
   }
 
   private createInitialBalls(): void {
@@ -294,7 +345,7 @@ export class SortingStation {
       const row = index % 5;
       const position = source.center
         .clone()
-        .add(new Vector3(-0.06 + column * 0.12, 0.34 + column * 0.11, -0.24 + row * 0.12));
+        .add(new Vector3(-0.07 + column * 0.14, WALL_THICKNESS * 0.5 + BALL_RADIUS + 0.004, -0.222 + row * 0.111));
       this.createBall(`B${index + 1}`, color, position);
     });
   }
@@ -321,6 +372,7 @@ export class SortingStation {
       angularDamping: 0.2,
     });
     this.world.addBody(body);
+    body.sleep();
     this.balls.push({
       id,
       color,

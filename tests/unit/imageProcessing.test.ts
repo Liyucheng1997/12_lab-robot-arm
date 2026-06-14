@@ -80,14 +80,15 @@ describe('detectBlobs', () => {
     expect(blobs[0].confidence).toBeLessThan(0.6);
   });
 
-  it('scenario 4: two touching same-color balls merge into one large component', () => {
+  it('scenario 4: two touching same-color balls are split along the component major axis', () => {
     const buffer = makeBuffer();
     // one contiguous red region representing two touching balls
     fillRect(buffer, 6, 10, 30, 22, 255, 30, 30);
 
     const blobs = detectBlobs(buffer, WIDTH, HEIGHT);
-    expect(blobs).toHaveLength(1);
-    expect(blobs[0].areaPx).toBe(24 * 12);
+    expect(blobs).toHaveLength(2);
+    expect(blobs.every((blob) => blob.color === 'red')).toBe(true);
+    expect(blobs.reduce((sum, blob) => sum + blob.areaPx, 0)).toBe(24 * 12);
   });
 
   it('scenario 5: an all-black buffer yields no blobs and ~0 usable ratio', () => {

@@ -4,7 +4,7 @@ import type { BallColor } from '../sorting/SortingStation';
 /** Operator-selectable recognition mode. Online (image-based) is the default. */
 export type VisionMode = 'online' | 'offline';
 
-/** One captured observation of the work area from the overhead camera. */
+/** One captured observation of the work area from the fixed station camera. */
 export interface VisionFrame {
   width: number;
   height: number;
