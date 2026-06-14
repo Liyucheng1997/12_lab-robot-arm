@@ -12,8 +12,8 @@ import {
   Vector3,
 } from 'three';
 
-export type BallColor = 'red' | 'green';
-export type BinColor = 'white' | 'red' | 'green';
+export type BallColor = 'red' | 'blue';
+export type BinColor = 'white' | 'red' | 'blue';
 
 interface BinConfig {
   color: BinColor;
@@ -199,7 +199,7 @@ export class SortingStation {
     const configs: BinConfig[] = [
       { color: 'red', center: new Vector3(1.18, BIN_FLOOR_Y, -0.72), visualColor: 0xc83232 },
       { color: 'white', center: new Vector3(1.22, BIN_FLOOR_Y, 0), visualColor: 0xe8edf2 },
-      { color: 'green', center: new Vector3(1.18, BIN_FLOOR_Y, 0.72), visualColor: 0x2f9e44 },
+      { color: 'blue', center: new Vector3(1.18, BIN_FLOOR_Y, 0.72), visualColor: 0x2f6fff },
     ];
 
     configs.forEach((config) => {
@@ -288,7 +288,7 @@ export class SortingStation {
       return;
     }
 
-    const colors: BallColor[] = ['red', 'red', 'red', 'red', 'red', 'green', 'green', 'green', 'green', 'green'];
+    const colors: BallColor[] = ['red', 'red', 'red', 'red', 'red', 'blue', 'blue', 'blue', 'blue', 'blue'];
     colors.forEach((color, index) => {
       const column = Math.floor(index / 5);
       const row = index % 5;
@@ -301,7 +301,7 @@ export class SortingStation {
 
   private createBall(id: string, color: BallColor, position: Vector3): void {
     const material = new MeshStandardMaterial({
-      color: color === 'red' ? 0xff3b30 : 0x30d158,
+      color: color === 'red' ? 0xff3b30 : 0x2f6fff,
       metalness: 0.08,
       roughness: 0.42,
     });

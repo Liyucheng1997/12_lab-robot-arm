@@ -13,16 +13,12 @@ import {
   Vector3,
 } from 'three';
 import type { BallColor, SortableBall } from '../sorting/SortingStation';
+import type { VisionDetection, VisionFrame, VisionSystem } from './VisionSystem';
 
-export interface VisionDetection {
-  ballId: string;
-  color: BallColor;
-  pixel: Vector2;
-  estimatedWorldPosition: Vector3;
-  confidence: number;
-}
+export type { VisionDetection } from './VisionSystem';
 
-export class OfflineVisionSystem {
+export class OfflineVisionSystem implements VisionSystem {
+  readonly mode = 'offline' as const;
   readonly camera = new PerspectiveCamera(42, 4 / 3, 0.05, 8);
   readonly group = new Group();
   readonly imageSize = new Vector2(320, 240);
@@ -30,7 +26,7 @@ export class OfflineVisionSystem {
   private readonly raycaster = new Raycaster();
   private readonly detectionMarkers = new Group();
 
-  constructor() {
+  constructor(private readonly getBalls: () => readonly SortableBall[]) {
     this.camera.name = 'Fixed overhead vision camera';
     this.camera.position.set(1.2, 3.05, 0);
     this.camera.lookAt(1.2, 0.18, 0);
@@ -43,12 +39,23 @@ export class OfflineVisionSystem {
     this.group.add(this.createCameraRig(), helper, this.detectionMarkers);
   }
 
-  detectBalls(balls: readonly SortableBall[]): VisionDetection[] {
+  /** Offline path does not read pixels; it synthesizes an always-observable frame. */
+  observe(): VisionFrame {
+    return {
+      width: this.imageSize.x,
+      height: this.imageSize.y,
+      pixels: new Uint8Array(0),
+      usablePixelRatio: 1,
+      isObservable: true,
+    };
+  }
+
+  detectBalls(): VisionDetection[] {
     this.camera.updateMatrixWorld(true);
     this.camera.updateProjectionMatrix();
     this.detectionMarkers.clear();
 
-    return balls
+    return this.getBalls()
       .map((ball) => this.detectBall(ball))
       .filter((detection): detection is VisionDetection => detection !== null)
       .sort((left, right) => right.confidence - left.confidence);
@@ -77,6 +84,7 @@ export class OfflineVisionSystem {
       pixel,
       estimatedWorldPosition,
       confidence,
+      areaPx: 1,
     };
   }
 
@@ -95,7 +103,7 @@ export class OfflineVisionSystem {
 
   private computeConfidence(ndc: Vector3, color: BallColor): number {
     const distanceFromCenter = Math.sqrt(ndc.x * ndc.x + ndc.y * ndc.y);
-    const colorPrior = color === 'red' || color === 'green' ? 0.98 : 0.75;
+    const colorPrior = color === 'red' || color === 'blue' ? 0.98 : 0.75;
     return Math.max(0.55, colorPrior - distanceFromCenter * 0.18);
   }
 
@@ -103,7 +111,7 @@ export class OfflineVisionSystem {
     const marker = new Mesh(
       new RingGeometry(0.07, 0.082, 32),
       new MeshBasicMaterial({
-        color: color === 'red' ? 0xff6b6b : 0x69db7c,
+        color: color === 'red' ? 0xff6b6b : 0x6b9bff,
         transparent: true,
         opacity: 0.92,
       }),

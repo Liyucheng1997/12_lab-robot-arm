@@ -27,7 +27,15 @@ import { createAxes } from './utils/axes';
 import { formatVector, lerpAngles, vectorFromTuple } from './utils/math';
 import { Logger } from './utils/logger';
 import { SortingStation, type SortPlanTarget, type SortableBall } from './sorting/SortingStation';
-import { OfflineVisionSystem, type VisionDetection } from './vision/OfflineVisionSystem';
+import { OfflineVisionSystem } from './vision/OfflineVisionSystem';
+import { OnlineVisionSystem } from './vision/OnlineVisionSystem';
+import type { VisionDetection, VisionMode } from './vision/VisionSystem';
+import {
+  AutoSortController,
+  type AutoSortDeps,
+  type ControllerState,
+  type SortReport,
+} from './sorting/AutoSortController';
 
 const GRIPPER_OPEN_OPENING = 0.18;
 const GRIPPER_CLOSED_OPENING = 0.145;
@@ -89,13 +97,38 @@ let operationStatus = 'select a ball';
 let latestDetections: VisionDetection[] = [];
 let selectedVisionDetection: VisionDetection | null = null;
 
-const vision = new OfflineVisionSystem();
+const vision = new OfflineVisionSystem(() => station.getBalls());
 scene.add(vision.group);
+
+const onlineVision = new OnlineVisionSystem(renderer, scene);
+onlineVision.hideDuringCapture = [vision.group, trajectoryLine, worldAxes];
+scene.add(onlineVision.group);
+
+let visionMode: VisionMode = 'online';
+let autoState: ControllerState = 'idle';
+let autoStatus = 'idle';
+let latestReport: SortReport | null = null;
+
+const autoDeps: AutoSortDeps = {
+  vision: onlineVision,
+  planAndExecute: (detection) => autoPlanAndExecute(detection),
+  isArmBusy: () => player.isPlaying() || carriedBall !== null,
+  onReport: (report) => {
+    latestReport = report;
+  },
+  onState: (state, status) => {
+    autoState = state;
+    autoStatus = status;
+    operationStatus = `auto: ${state} — ${status}`;
+    refreshGui();
+  },
+};
+const autoController = new AutoSortController(autoDeps);
 
 const visionPanel = document.createElement('div');
 visionPanel.className = 'vision-panel';
 visionPanel.innerHTML = [
-  '<strong>Offline Vision Camera</strong>',
+  '<strong>Overhead Vision Camera</strong>',
   '<div class="vision-preview"></div>',
   '<div class="vision-caption">Top-down camera stream with detected ball poses</div>',
   '<div class="vision-table"></div>',
@@ -184,6 +217,18 @@ gui = createRobotGui({
     }
     executePlannedSortTrajectory();
   },
+  onAutoStart: () => {
+    latestReport = null;
+    autoController.start();
+  },
+  onAutoStop: () => {
+    autoController.stop();
+  },
+  onVisionModeChanged: (mode) => {
+    visionMode = mode;
+    autoDeps.vision = mode === 'online' ? onlineVision : vision;
+    operationStatus = `vision mode: ${mode}`;
+  },
   onPlayTrajectory: () => {
     plannedSortTrajectory = null;
     executionPhase = 'idle';
@@ -213,6 +258,7 @@ function animate(): void {
   const delta = clock.getDelta();
   station.update(delta);
   player.update(delta);
+  autoController.tick();
   controls.update();
   updateHud();
   updateVisionPanel();
@@ -285,9 +331,11 @@ function planSelectedBallSortTrajectory(): void {
 }
 
 function runVisionDetection(): void {
-  latestDetections = vision.detectBalls(station.getBalls());
+  latestDetections = vision.detectBalls();
   selectedVisionDetection = latestDetections[0] ?? null;
-  const selected = selectedVisionDetection ? station.selectBallById(selectedVisionDetection.ballId) : null;
+  const selected = selectedVisionDetection?.ballId
+    ? station.selectBallById(selectedVisionDetection.ballId)
+    : null;
   operationStatus = selectedVisionDetection
     ? `vision detected ${latestDetections.length}; selected ${selectedVisionDetection.ballId}`
     : 'vision detected no balls';
@@ -307,7 +355,9 @@ function planFromVisionDetection(): void {
     return;
   }
 
-  const ball = station.getBallById(selectedVisionDetection.ballId);
+  const ball = selectedVisionDetection.ballId
+    ? station.getBallById(selectedVisionDetection.ballId)
+    : null;
   if (!ball) {
     operationStatus = `vision planning failed: missing ${selectedVisionDetection.ballId}`;
     return;
@@ -322,6 +372,44 @@ function planFromVisionDetection(): void {
     selectedVisionDetection.estimatedWorldPosition.clone(),
   );
   planSortTrajectoryForTarget(target, 'vision');
+}
+
+function autoPlanAndExecute(detection: VisionDetection): 'started' | 'unreachable' {
+  const ball = findNearestBall(detection.estimatedWorldPosition);
+  if (!ball) {
+    return 'unreachable';
+  }
+  station.selectBallById(ball.id);
+  player.stop();
+  releaseCarriedBall();
+  robot.setGripperOpening(GRIPPER_OPEN_OPENING);
+  // Recognition (color + which ball) is online; the grasp uses the matched ball's actual
+  // pose so back-projection error does not cause spurious missed grasps.
+  const target = station.createPlanTarget(ball);
+  planSortTrajectoryForTarget(target, 'vision');
+  if (!plannedSortTrajectory) {
+    return 'unreachable';
+  }
+  executePlannedSortTrajectory();
+  return 'started';
+}
+
+function findNearestBall(worldPosition: Vector3): SortableBall | null {
+  let nearest: SortableBall | null = null;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  station.getBalls().forEach((ball) => {
+    if (ball.mesh.parent !== station.group) {
+      return;
+    }
+    const position = new Vector3();
+    ball.mesh.getWorldPosition(position);
+    const distance = position.distanceTo(worldPosition);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = ball;
+    }
+  });
+  return nearestDistance <= 0.35 ? nearest : null;
 }
 
 function planSortTrajectoryForTarget(target: SortPlanTarget, source: 'manual' | 'vision'): void {
@@ -551,8 +639,10 @@ function handleTrajectoryComplete(): void {
     if (graspError > GRASP_ATTACH_TOLERANCE) {
       robot.setGripperOpening(GRIPPER_OPEN_OPENING);
       executionPhase = 'idle';
+      plannedSortTrajectory = null;
       operationStatus = `pick failed error=${graspError.toFixed(3)}m`;
       refreshGui();
+      autoController.onTrajectoryComplete(false);
       return;
     }
 
@@ -568,6 +658,7 @@ function handleTrajectoryComplete(): void {
     player.setWaypoints(plannedSortTrajectory.placeWaypoints);
     player.play();
     refreshGui();
+    autoController.onTrajectoryComplete(true);
     return;
   }
 
@@ -575,6 +666,7 @@ function handleTrajectoryComplete(): void {
     releaseCarriedBall();
     plannedSortTrajectory = null;
     executionPhase = 'idle';
+    autoController.onTrajectoryComplete(true);
   }
 }
 
@@ -667,7 +759,9 @@ function updateHud(): void {
   const dhPose = forwardKinematicsDH(robot.getJointAngles());
   const orientation = visualPose.orientation;
   hud.innerHTML = [
-    '<strong>Manual Sorting Station</strong>',
+    '<strong>Vision Sorting Station</strong>',
+    `Mode: ${visionMode} | Auto: ${autoState} — ${autoStatus}`,
+    formatAutoReport(),
     `Selected: ${station.getStatusLabel()}`,
     `Operation: ${operationStatus}`,
     `Vision: ${formatVisionStatus()}`,
@@ -678,6 +772,17 @@ function updateHud(): void {
     `EE quaternion: ${formatQuaternion(orientation)}`,
     `Trajectory: ${player.isPlaying() ? executionPhase : 'idle'} | samples: ${trajectoryPositions.length}`,
   ].join('<br />');
+}
+
+function formatAutoReport(): string {
+  if (!latestReport) {
+    return 'Report: —';
+  }
+  const skips = latestReport.skipped
+    .map((decision) => `${decision.detection.ballId ?? 'ball'}:${decision.skipReason}`)
+    .join(', ');
+  const blind = latestReport.endedBlind ? ' [blind halt]' : '';
+  return `Report: ${latestReport.sortedCount}/${latestReport.totalSeen} sorted${blind}; skipped: ${skips || 'none'}`;
 }
 
 function formatVisionStatus(): string {

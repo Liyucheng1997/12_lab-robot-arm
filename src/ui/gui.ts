@@ -22,6 +22,9 @@ interface RobotGuiOptions {
   onRunVisionDetection: () => void;
   onPlanFromVision: () => void;
   onPickVisionResult: () => void;
+  onAutoStart: () => void;
+  onAutoStop: () => void;
+  onVisionModeChanged: (mode: 'online' | 'offline') => void;
   onPlayTrajectory: () => void;
   onFramesVisibleChanged: (visible: boolean) => void;
   onTrajectoryVisibleChanged: (visible: boolean) => void;
@@ -42,6 +45,9 @@ export function createRobotGui(options: RobotGuiOptions): RobotGuiApi {
   const sortingState = {
     selectedBall: options.getSelectedBallId(),
   };
+  const autoStateUi = {
+    visionMode: 'online' as 'online' | 'offline',
+  };
   const actions = {
     reset: options.onReset,
     homePose: options.onHome,
@@ -52,6 +58,8 @@ export function createRobotGui(options: RobotGuiOptions): RobotGuiApi {
     runVisionDetection: options.onRunVisionDetection,
     planFromVision: options.onPlanFromVision,
     pickVisionResult: options.onPickVisionResult,
+    autoStart: options.onAutoStart,
+    autoStop: options.onAutoStop,
     playTrajectory: options.onPlayTrajectory,
   };
 
@@ -78,7 +86,17 @@ export function createRobotGui(options: RobotGuiOptions): RobotGuiApi {
   sortingFolder.add(actions, 'releaseObject').name('Release object');
   sortingFolder.add(actions, 'solveIK').name('Solve IK debug');
 
-  const visionFolder = gui.addFolder('Offline Vision');
+  const autoFolder = gui.addFolder('Auto Sort');
+  autoFolder
+    .add(autoStateUi, 'visionMode', ['online', 'offline'])
+    .name('Vision mode')
+    .onChange((mode: 'online' | 'offline') => {
+      options.onVisionModeChanged(mode);
+    });
+  autoFolder.add(actions, 'autoStart').name('Start');
+  autoFolder.add(actions, 'autoStop').name('Stop');
+
+  const visionFolder = gui.addFolder('Vision (manual debug)');
   visionFolder.add(actions, 'runVisionDetection').name('Run detection');
   visionFolder.add(actions, 'planFromVision').name('Plan from vision');
   visionFolder.add(actions, 'pickVisionResult').name('Pick vision result');
