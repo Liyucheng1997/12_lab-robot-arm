@@ -1,11 +1,14 @@
 import {
   BoxGeometry,
+  CapsuleGeometry,
+  CylinderGeometry,
   Group,
+  Material,
   Matrix4,
   Mesh,
-  MeshStandardMaterial,
   Object3D,
   Quaternion,
+  TorusGeometry,
   Vector3,
 } from 'three';
 import type { Pose } from '../types/robot';
@@ -20,6 +23,14 @@ import {
 } from './limits';
 import { Link } from './Link';
 import { Joint } from './Joint';
+import {
+  brushedMetalMaterial,
+  darkMetalMaterial,
+  jointSealMaterial,
+  robotPaintMaterial,
+  robotPaintShadowMaterial,
+  rubberMaterial,
+} from './materials';
 
 export class RobotArm {
   readonly group = new Group();
@@ -142,7 +153,6 @@ export class RobotArm {
         `Link ${index + 1}`,
         vectorFromTuple(config.offsetToNext),
         config.linkRadius,
-        config.linkColor,
       );
       joint.group.add(link.group);
 
@@ -153,21 +163,49 @@ export class RobotArm {
     });
 
     this.endEffector.name = 'End effector';
-    this.endEffector.position.set(...DEFAULT_JOINT_CONFIGS[DEFAULT_JOINT_CONFIGS.length - 1].offsetToNext);
+    this.endEffector.position.set(
+      ...DEFAULT_JOINT_CONFIGS[DEFAULT_JOINT_CONFIGS.length - 1].offsetToNext,
+    );
     this.endEffector.add(this.createParallelGripper());
     this.endEffector.add(this.endEffectorFrame);
     parent.add(this.endEffector);
   }
 
-  private createBase(): Mesh {
-    const base = new Mesh(
-      new BoxGeometry(0.62, 0.18, 0.62),
-      new MeshStandardMaterial({ color: 0x2f3a44, metalness: 0.45, roughness: 0.4 }),
-    );
+  private createBase(): Group {
+    const base = new Group();
     base.name = 'Robot pedestal';
-    base.position.y = 0.08;
-    base.castShadow = true;
-    base.receiveShadow = true;
+    base.position.set(ROBOT_BASE_OFFSET[0], 0, ROBOT_BASE_OFFSET[2]);
+
+    const flange = new Mesh(new CylinderGeometry(0.32, 0.35, 0.075, 64), darkMetalMaterial);
+    flange.position.y = 0.038;
+    base.add(flange);
+
+    const plinth = new Mesh(new CylinderGeometry(0.245, 0.285, 0.19, 64), robotPaintShadowMaterial);
+    plinth.position.y = 0.135;
+    base.add(plinth);
+
+    const seal = new Mesh(new TorusGeometry(0.218, 0.014, 10, 64), jointSealMaterial);
+    seal.rotation.x = Math.PI / 2;
+    seal.position.y = 0.225;
+    base.add(seal);
+
+    for (const [x, z] of [
+      [-0.22, -0.22],
+      [-0.22, 0.22],
+      [0.22, -0.22],
+      [0.22, 0.22],
+    ]) {
+      const bolt = new Mesh(new CylinderGeometry(0.022, 0.022, 0.012, 24), brushedMetalMaterial);
+      bolt.position.set(x, 0.081, z);
+      base.add(bolt);
+    }
+
+    base.traverse((child) => {
+      if (child instanceof Mesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
     return base;
   }
 
@@ -175,59 +213,58 @@ export class RobotArm {
     const gripper = new Group();
     gripper.name = 'Parallel jaw gripper';
 
-    const bodyMaterial = new MeshStandardMaterial({
-      color: 0x384653,
-      metalness: 0.48,
-      roughness: 0.34,
-    });
-    const jawMaterial = new MeshStandardMaterial({
-      color: 0xf0b429,
-      metalness: 0.32,
-      roughness: 0.38,
-    });
-    const padMaterial = new MeshStandardMaterial({
-      color: 0x151719,
-      metalness: 0.08,
-      roughness: 0.72,
-    });
-
-    const flange = this.createGripperBox('Tool flange', [0.08, 0.16, 0.16], bodyMaterial);
-    flange.position.x = 0.04;
+    const flange = new Mesh(new CylinderGeometry(0.082, 0.082, 0.065, 40), brushedMetalMaterial);
+    flange.name = 'Tool flange';
+    flange.rotation.z = Math.PI / 2;
+    flange.position.x = 0.032;
     gripper.add(flange);
 
-    const actuator = this.createGripperBox('Gripper actuator', [0.12, 0.18, 0.22], bodyMaterial);
-    actuator.position.x = 0.14;
+    const flangeSeal = new Mesh(new TorusGeometry(0.084, 0.009, 8, 40), jointSealMaterial);
+    flangeSeal.rotation.y = Math.PI / 2;
+    flangeSeal.position.x = 0.07;
+    gripper.add(flangeSeal);
+
+    const actuator = new Mesh(new CylinderGeometry(0.095, 0.082, 0.13, 40), robotPaintMaterial);
+    actuator.name = 'Gripper actuator';
+    actuator.rotation.z = Math.PI / 2;
+    actuator.position.x = 0.13;
     gripper.add(actuator);
 
-    const rail = this.createGripperBox('Jaw guide rail', [0.2, 0.045, 0.24], bodyMaterial);
-    rail.position.x = 0.22;
+    const rail = this.createGripperBox('Jaw guide rail', [0.16, 0.045, 0.22], darkMetalMaterial);
+    rail.position.x = 0.23;
     rail.position.y = 0.01;
     gripper.add(rail);
 
     this.leftFinger.name = 'Left gripper finger';
-    this.leftFinger.add(this.createFingerMesh(jawMaterial, padMaterial, 1));
+    this.leftFinger.add(this.createFingerMesh(brushedMetalMaterial, rubberMaterial, 1));
 
     this.rightFinger.name = 'Right gripper finger';
-    this.rightFinger.add(this.createFingerMesh(jawMaterial, padMaterial, -1));
+    this.rightFinger.add(this.createFingerMesh(brushedMetalMaterial, rubberMaterial, -1));
 
     gripper.add(this.leftFinger, this.rightFinger);
     this.setGripperOpening(this.gripperOpening);
+    gripper.traverse((child) => {
+      if (child instanceof Mesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
     return gripper;
   }
 
-  private createFingerMesh(
-    jawMaterial: MeshStandardMaterial,
-    padMaterial: MeshStandardMaterial,
-    side: 1 | -1,
-  ): Group {
+  private createFingerMesh(jawMaterial: Material, padMaterial: Material, side: 1 | -1): Group {
     const finger = new Group();
 
     const knuckle = this.createGripperBox('Finger knuckle', [0.08, 0.09, 0.045], jawMaterial);
     knuckle.position.set(0.22, 0, 0);
     finger.add(knuckle);
 
-    const jaw = this.createGripperBox('Finger jaw', [0.28, 0.055, 0.04], jawMaterial);
+    const jaw = new Mesh(new CapsuleGeometry(0.026, 0.23, 5, 16), jawMaterial);
+    jaw.name = 'Finger jaw';
+    jaw.rotation.z = Math.PI / 2;
     jaw.position.set(0.36, 0, 0);
+    jaw.castShadow = true;
+    jaw.receiveShadow = true;
     finger.add(jaw);
 
     const pad = this.createGripperBox('Finger contact pad', [0.18, 0.058, 0.012], padMaterial);
@@ -236,15 +273,8 @@ export class RobotArm {
     return finger;
   }
 
-  private createGripperBox(
-    name: string,
-    size: [number, number, number],
-    material: MeshStandardMaterial,
-  ): Mesh {
-    const mesh = new Mesh(
-      new BoxGeometry(size[0], size[1], size[2]),
-      material,
-    );
+  private createGripperBox(name: string, size: [number, number, number], material: Material): Mesh {
+    const mesh = new Mesh(new BoxGeometry(size[0], size[1], size[2]), material);
     mesh.name = name;
     mesh.castShadow = true;
     mesh.receiveShadow = true;

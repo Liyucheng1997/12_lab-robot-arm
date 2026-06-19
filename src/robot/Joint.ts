@@ -1,7 +1,8 @@
-import { Group, Mesh, MeshStandardMaterial, Quaternion, SphereGeometry, Vector3 } from 'three';
+import { CylinderGeometry, Group, Material, Mesh, Quaternion, Vector3 } from 'three';
 import type { JointLimit } from '../types/robot';
 import { createAxes } from '../utils/axes';
 import { clamp } from '../utils/math';
+import { jointSealMaterial, robotPaintMaterial, robotPaintShadowMaterial } from './materials';
 
 export class Joint {
   readonly group = new Group();
@@ -36,14 +37,40 @@ export class Joint {
     this.frame.visible = visible;
   }
 
-  private createJointBody(): Mesh {
-    const geometry = new SphereGeometry(this.bodyRadius, 32, 18);
-    const material = new MeshStandardMaterial({
-      color: 0x25313d,
-      metalness: 0.55,
-      roughness: 0.35,
-    });
+  private createJointBody(): Group {
+    const assembly = new Group();
+    assembly.name = `${this.name} housing`;
+
+    const coreDepth = this.bodyRadius * 1.34;
+    const core = this.createAxialPart(
+      new CylinderGeometry(this.bodyRadius, this.bodyRadius, coreDepth, 48),
+      robotPaintMaterial,
+    );
+    assembly.add(core);
+
+    const capDepth = this.bodyRadius * 0.19;
+    const capOffset = coreDepth * 0.5 + capDepth * 0.32;
+    for (const side of [-1, 1]) {
+      const seal = this.createAxialPart(
+        new CylinderGeometry(this.bodyRadius * 1.035, this.bodyRadius * 1.035, capDepth, 48),
+        jointSealMaterial,
+      );
+      seal.position.copy(this.axis).multiplyScalar(side * capOffset);
+      assembly.add(seal);
+
+      const cap = this.createAxialPart(
+        new CylinderGeometry(this.bodyRadius * 0.82, this.bodyRadius * 0.9, capDepth * 0.82, 48),
+        robotPaintShadowMaterial,
+      );
+      cap.position.copy(this.axis).multiplyScalar(side * (capOffset + capDepth * 0.72));
+      assembly.add(cap);
+    }
+    return assembly;
+  }
+
+  private createAxialPart(geometry: CylinderGeometry, material: Material): Mesh {
     const mesh = new Mesh(geometry, material);
+    mesh.quaternion.copy(new Quaternion().setFromUnitVectors(new Vector3(0, 1, 0), this.axis));
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     return mesh;
