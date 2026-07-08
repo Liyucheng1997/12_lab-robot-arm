@@ -3,153 +3,314 @@ import {
   BufferGeometry,
   Clock,
   Float32BufferAttribute,
+  Group,
   Line,
   LineBasicMaterial,
-  Quaternion,
-  Raycaster,
-  Vector2,
   Vector3,
 } from 'three';
 import { createCamera } from './scene/camera';
 import { createControls } from './scene/controls';
 import { createScene } from './scene/createScene';
 import { createRenderer } from './scene/renderer';
+import { applyFactoryAtmosphere, createFactoryDecor, type AndonState } from './scene/factory';
+import { createPostPipeline } from './scene/postprocessing';
 import { RobotArm } from './robot/RobotArm';
-import { createDefaultTrajectory, JointTrajectoryPlayer } from './robot/trajectory';
-import type { JointWaypoint } from './types/robot';
-import type { IKResult } from './types/robot';
-import { computeVisualChainState, forwardKinematics, forwardKinematicsDH, solveIK } from './robot/kinematics';
+import { JointTrajectoryPlayer } from './robot/trajectory';
+import type { IKResult, JointWaypoint } from './types/robot';
+import { computeVisualChainState, solveIK } from './robot/kinematics';
 import {
   checkGroundClearance,
   checkObstacleCollision,
   checkSelfCollision,
   checkTrajectoryGroundClearance,
   checkTrajectoryObstacleCollision,
+  type StaticObstacle,
 } from './robot/collision';
 import { GRIPPER_GRASP_OFFSET, HOME_POSE, ZERO_POSE } from './robot/limits';
 import { createRobotGui, type RobotGuiApi } from './ui/gui';
 import { createAxes } from './utils/axes';
 import { formatVector, lerpAngles, vectorFromTuple } from './utils/math';
 import { Logger } from './utils/logger';
-import { SortingStation, type SortPlanTarget, type SortableBall } from './sorting/SortingStation';
-import { OfflineVisionSystem } from './vision/OfflineVisionSystem';
-import { OnlineVisionSystem } from './vision/OnlineVisionSystem';
-import type { VisionDetection, VisionMode } from './vision/VisionSystem';
+import { InfeedConveyor } from './assembly/InfeedConveyor';
+import { MainLine } from './assembly/MainLine';
+import { createStationScreen, type StationScreen } from './assembly/StationScreen';
+import type { AssemblyPart } from './assembly/parts';
 import {
-  AutoSortController,
-  type AutoSortDeps,
-  type ControllerState,
-  type SortReport,
-} from './sorting/AutoSortController';
+  ASSEMBLY_SEQUENCE,
+  CELL_REGION,
+  PART_SPECS,
+  PART_TYPE_BY_MARKER,
+  PICK_REGION,
+  PLACE_LOCAL_X,
+  STATION_COUNT,
+  VISION_CAMERA_FOV,
+  VISION_CAMERA_LOCAL_POSITION,
+  VISION_CAMERA_LOCAL_TARGET,
+  MAIN_LINE_Z,
+  obstaclesForStation,
+  stationOffsetX,
+  type AssemblyPlanTarget,
+  type DetectionRegion,
+  type PartType,
+} from './assembly/layout';
+import {
+  StationController,
+  type StationReport,
+  type StationState,
+} from './assembly/StationController';
+import { OnlineVisionSystem } from './vision/OnlineVisionSystem';
+import type { DetectionColor, VisionDetection } from './vision/VisionSystem';
+import { EffectsManager } from './fx/effects';
 
 const GRIPPER_OPEN_OPENING = 0.18;
-const GRIPPER_CLOSED_OPENING = 0.145;
 const GRASP_ATTACH_TOLERANCE = 0.05;
 const PICK_DURATION_SECONDS = 3.2;
 const PLACE_DURATION_SECONDS = 3.8;
 const PLANNED_TRAJECTORY_SAMPLES = 96;
 const SAFE_HOME_TIME_SECONDS = 1.25;
-const VISION_PREVIEW_INTERVAL_SECONDS = 0.12;
+const VISION_PREVIEW_INTERVAL_SECONDS = 0.15;
 const VISION_PREVIEW_WIDTH = 320;
 const VISION_PREVIEW_HEIGHT = 240;
+/** Max horizontal disagreement between the vision estimate and the pick station. */
+const VISION_MATCH_RADIUS = 0.3;
 
-interface PlannedSortTrajectory {
-  ball: SortableBall;
-  pickPosition: Vector3;
+const TRAJECTORY_COLORS = [0x39d98a, 0x37b7ff, 0xffb547];
+
+interface PlannedTrajectory {
+  part: AssemblyPart;
+  /** Station-local grasp position at the pick point. */
+  pickPositionLocal: Vector3;
   pickWaypoints: JointWaypoint[];
   placeWaypoints: JointWaypoint[];
 }
 
 type ExecutionPhase = 'idle' | 'to-pick' | 'to-drop';
 
-const logger = new Logger('RobotSimulator');
+interface StationRig {
+  station: number;
+  partType: PartType;
+  offsetX: number;
+  robot: RobotArm;
+  player: JointTrajectoryPlayer;
+  infeed: InfeedConveyor;
+  vision: OnlineVisionSystem;
+  controller: StationController;
+  screen: StationScreen;
+  /** Planning obstacles, already translated into this station's local frame. */
+  obstacles: StaticObstacle[];
+  /** Scene-level holder for the gripped part; follows the grasp point, stays level. */
+  partCarrier: Group;
+  planned: PlannedTrajectory | null;
+  phase: ExecutionPhase;
+  carried: AssemblyPart | null;
+  trajectoryLine: Line;
+  trajectoryPositions: Vector3[];
+  state: StationState;
+  status: string;
+}
+
+const DETECTION_DRAW_COLORS: Record<DetectionColor, string> = {
+  red: '#ff3f4b',
+  blue: '#337cff',
+  yellow: '#ffd60a',
+};
+
+const logger = new Logger('AssemblyLine');
 const app = document.querySelector<HTMLDivElement>('#app');
 
 if (!app) {
   throw new Error('Missing #app container');
 }
 
+// --- scene & shared hardware ---------------------------------------------------
+
 const scene = createScene();
 const camera = createCamera();
 const renderer = createRenderer(app);
 const controls = createControls(camera, renderer);
 const clock = new Clock();
-const raycaster = new Raycaster();
-const pointer = new Vector2();
+
+applyFactoryAtmosphere(scene, renderer);
+const factory = createFactoryDecor();
+scene.add(factory.group);
+
+const postPipeline = createPostPipeline(renderer, scene, camera);
 
 const worldAxes = createAxes(0.5);
 worldAxes.name = 'World coordinate frame';
+worldAxes.visible = false;
 scene.add(worldAxes);
 
-const robot = new RobotArm();
-robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-scene.add(robot.group);
+const effects = new EffectsManager();
+scene.add(effects.group);
 
-const station = new SortingStation();
-scene.add(station.group);
+const mainLine = new MainLine();
+scene.add(mainLine.group);
 
-const trajectoryPositions: Vector3[] = [];
-let trajectoryGeometry = new BufferGeometry();
-const trajectoryLine = new Line(
-  trajectoryGeometry,
-  new LineBasicMaterial({ color: 0x39d98a, linewidth: 2 }),
-);
-trajectoryLine.name = 'Planned gripper trajectory';
-scene.add(trajectoryLine);
+// --- runtime state ---------------------------------------------------------------
 
 let gui: RobotGuiApi | null = null;
-let plannedSortTrajectory: PlannedSortTrajectory | null = null;
-let executionPhase: ExecutionPhase = 'idle';
-let carriedBall: SortableBall | null = null;
-let operationStatus = 'select a ball';
+let speedFactor = 1;
+let orbitEnabled = false;
+let orbitAngle = 0.62;
+let lineRunning = false;
+let previewStation = 0;
 let latestDetections: VisionDetection[] = [];
-let latestOnlineDetections: VisionDetection[] = [];
-let selectedVisionDetection: VisionDetection | null = null;
 let visionPreviewElapsed = VISION_PREVIEW_INTERVAL_SECONDS;
+const stationReports: (StationReport | null)[] = Array.from({ length: STATION_COUNT }, () => null);
+let lineReportLine: string | null = null;
 
-const vision = new OfflineVisionSystem(() => station.getBalls());
-scene.add(vision.group);
+// --- station rigs ----------------------------------------------------------------
 
-const onlineVision = new OnlineVisionSystem(renderer, scene);
-onlineVision.hideDuringCapture = [vision.group, trajectoryLine, worldAxes];
-scene.add(onlineVision.group);
+function offsetRegion(region: DetectionRegion, dx: number): DetectionRegion {
+  return { minX: region.minX + dx, maxX: region.maxX + dx, minZ: region.minZ, maxZ: region.maxZ };
+}
 
-let visionMode: VisionMode = 'online';
-let autoState: ControllerState = 'idle';
-let autoStatus = 'idle';
-let latestReport: SortReport | null = null;
+const rigs: StationRig[] = ASSEMBLY_SEQUENCE.map((partType, station) => {
+  const offsetX = stationOffsetX(station);
 
-const autoDeps: AutoSortDeps = {
-  vision: onlineVision,
-  planAndExecute: (detection) => autoPlanAndExecute(detection),
-  isArmBusy: () => player.isPlaying() || carriedBall !== null,
-  onReport: (report) => {
-    latestReport = report;
-  },
-  onState: (state, status) => {
-    autoState = state;
-    autoStatus = status;
-    operationStatus = `auto: ${state} — ${status}`;
-    refreshGui();
-  },
-};
-const autoController = new AutoSortController(autoDeps);
+  const robot = new RobotArm();
+  robot.group.position.x = offsetX;
+  robot.setGripperOpening(GRIPPER_OPEN_OPENING);
+  scene.add(robot.group);
+
+  const infeed = new InfeedConveyor(station, partType);
+  scene.add(infeed.group);
+
+  const vision = new OnlineVisionSystem(renderer, scene, {
+    name: `ST${station + 1} vision`,
+    fov: VISION_CAMERA_FOV,
+    position: VISION_CAMERA_LOCAL_POSITION.clone().add(new Vector3(offsetX, 0, 0)),
+    target: VISION_CAMERA_LOCAL_TARGET.clone().add(new Vector3(offsetX, 0, 0)),
+    pickRegion: offsetRegion(PICK_REGION, offsetX),
+    cellRegion: offsetRegion(CELL_REGION, offsetX),
+  });
+  scene.add(vision.group);
+
+  const screen = createStationScreen(
+    new Vector3(offsetX + PLACE_LOCAL_X - 0.55, 0, MAIN_LINE_Z + 0.62),
+  );
+  scene.add(screen.group);
+
+  const partCarrier = new Group();
+  partCarrier.name = `ST${station + 1} part carrier`;
+  scene.add(partCarrier);
+
+  const trajectoryLine = new Line(
+    new BufferGeometry(),
+    new LineBasicMaterial({ color: TRAJECTORY_COLORS[station % TRAJECTORY_COLORS.length] }),
+  );
+  trajectoryLine.name = `ST${station + 1} trajectory`;
+  scene.add(trajectoryLine);
+
+  const rig: StationRig = {
+    station,
+    partType,
+    offsetX,
+    robot,
+    player: null as unknown as JointTrajectoryPlayer,
+    infeed,
+    vision,
+    controller: null as unknown as StationController,
+    screen,
+    obstacles: obstaclesForStation(station),
+    partCarrier,
+    planned: null,
+    phase: 'idle',
+    carried: null,
+    trajectoryLine,
+    trajectoryPositions: [],
+    state: 'idle',
+    status: '待机',
+  };
+
+  rig.player = new JointTrajectoryPlayer(
+    robot,
+    () => recordGraspPosition(rig),
+    () => handleTrajectoryComplete(rig),
+  );
+
+  rig.controller = new StationController(station, partType, {
+    vision,
+    isPartReady: () => infeed.getPartAtPickStation() !== null,
+    isCarrierReady: () => mainLine.getCarrierProgress(station) === station,
+    planAndExecute: (detection) => planAndExecute(rig, detection),
+    isArmBusy: () => rig.player.isPlaying() || rig.carried !== null,
+    rejectPart: () => infeed.rejectFrontPart(),
+    startFasten: () => {
+      effects.spawnSparks(mainLine.getStackTopPosition(station));
+      mainLine.beginFasten(station, () => {
+        effects.spawnFlashRing(mainLine.getStackTopPosition(station), 0x39d98a);
+        rig.controller.onFastenComplete();
+      });
+    },
+    releaseCarrier: () => mainLine.release(station),
+    onState: (state, status) => {
+      rig.state = state;
+      rig.status = status;
+      factory.setAndonState(station, andonStateFor(state));
+      updateStationScreen(rig);
+    },
+    onReport: (report) => {
+      stationReports[station] = report;
+    },
+  });
+
+  return rig;
+});
+
+// Every station camera must hide every overlay — including the OTHER stations'
+// detection markers, whose saturated ring colors would segment as parts.
+const sharedOverlays = [
+  worldAxes,
+  effects.group,
+  ...rigs.map((rig) => rig.trajectoryLine),
+  ...rigs.map((rig) => rig.screen.screenMesh),
+];
+rigs.forEach((rig) => {
+  rig.vision.hideDuringCapture = [
+    ...sharedOverlays,
+    ...rigs.filter((other) => other !== rig).map((other) => other.vision.group),
+  ];
+});
+
+function andonStateFor(state: StationState): AndonState {
+  if (state === 'blind') {
+    return 'fault';
+  }
+  if (state === 'idle' || state === 'done') {
+    return 'idle';
+  }
+  return 'running';
+}
+
+function updateStationScreen(rig: StationRig): void {
+  rig.screen.setLines([
+    `ST${rig.station + 1} · ${PART_SPECS[rig.partType].label}`,
+    rig.status,
+    `完成 ${rig.controller.getPartsPlaced()} 件`,
+  ]);
+}
+
+// --- DOM panels ------------------------------------------------------------------
 
 const visionPanel = document.createElement('div');
 visionPanel.className = 'vision-panel';
 visionPanel.innerHTML = [
-  '<strong>Online Detection Output</strong>',
+  '<strong class="vision-title">在线视觉 · ST1</strong>',
   '<div class="vision-preview"></div>',
-  '<div class="vision-caption">Live HSV segmentation | ball color + centroid only</div>',
+  '<div class="vision-caption">HSV 分割 | 标识色 → 零件类型 + 反投影坐标</div>',
   '<div class="vision-table"></div>',
 ].join('');
 app.appendChild(visionPanel);
 const visionPreview = visionPanel.querySelector<HTMLDivElement>('.vision-preview');
 const visionTable = visionPanel.querySelector<HTMLDivElement>('.vision-table');
-if (!visionPreview || !visionTable) {
+const visionTitle = visionPanel.querySelector<HTMLElement>('.vision-title');
+if (!visionPreview || !visionTable || !visionTitle) {
   throw new Error('Missing vision panel elements');
 }
 const visionTableElement = visionTable;
+const visionTitleElement = visionTitle;
 
 const visionDetectionCanvas = document.createElement('canvas');
 visionDetectionCanvas.width = VISION_PREVIEW_WIDTH;
@@ -162,120 +323,142 @@ const hud = document.createElement('div');
 hud.className = 'hud';
 app.appendChild(hud);
 
-const player = new JointTrajectoryPlayer(
-  robot,
-  () => {
-    recordGraspPosition();
-  },
-  () => {
-    handleTrajectoryComplete();
-  },
-);
+// --- GUI ---------------------------------------------------------------------------
 
 gui = createRobotGui({
-  robot,
-  onReset: () => {
-    player.stop();
-    robot.reset();
-    robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-    plannedSortTrajectory = null;
-    executionPhase = 'idle';
-    operationStatus = 'reset';
-    refreshGui();
-    resetTrajectoryLine();
-    logForwardKinematics();
+  robots: rigs.map((rig) => rig.robot),
+  robotLabels: rigs.map((rig) => `ST${rig.station + 1} ${PART_SPECS[rig.partType].label}`),
+  onProductionStart: () => {
+    lineReportLine = null;
+    stationReports.fill(null);
+    mainLine.resetStats();
+    lineRunning = true;
+    rigs.forEach((rig) => rig.controller.start());
   },
-  onHome: () => {
-    player.stop();
-    robot.home();
-    robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-    plannedSortTrajectory = null;
-    executionPhase = 'idle';
-    operationStatus = 'home pose';
-    refreshGui();
-    recordGraspPosition();
-    logForwardKinematics();
+  onProductionStop: () => {
+    lineRunning = false;
+    rigs.forEach((rig) => rig.controller.stop());
+    composeLineReport();
   },
-  onSolveIK: () => {
-    solveSelectedBallIKDebug();
+  onSpeedChanged: (multiplier) => {
+    speedFactor = multiplier;
   },
-  onPlanPickTrajectory: () => {
-    planSelectedBallSortTrajectory();
+  onBloomChanged: (enabled) => postPipeline.setBloomEnabled(enabled),
+  onOrbitChanged: (enabled) => {
+    orbitEnabled = enabled;
+    controls.enabled = !enabled;
   },
-  onPickTarget: () => {
-    executePlannedSortTrajectory();
+  onPreviewStationChanged: (station) => {
+    previewStation = station;
+    visionTitleElement.textContent = `在线视觉 · ST${station + 1}`;
   },
-  onReleaseObject: () => {
-    releaseCarriedBall();
-  },
-  ballIds: station.getBallIds(),
-  getSelectedBallId: () => station.getSelectedBallId(),
-  onSelectBall: (ballId) => {
-    const selected = ballId === 'none' ? null : station.selectBallById(ballId);
-    plannedSortTrajectory = null;
-    operationStatus = selected ? `selected ${selected.id} (${selected.color})` : 'select a ball';
-    resetTrajectoryLine();
-    refreshGui();
-  },
-  onRunVisionDetection: () => {
-    runVisionDetection();
-  },
-  onPlanFromVision: () => {
-    planFromVisionDetection();
-  },
-  onPickVisionResult: () => {
-    if (!plannedSortTrajectory) {
-      planFromVisionDetection();
-    }
-    executePlannedSortTrajectory();
-  },
-  onAutoStart: () => {
-    latestReport = null;
-    autoController.start();
-  },
-  onAutoStop: () => {
-    autoController.stop();
-  },
-  onVisionModeChanged: (mode) => {
-    visionMode = mode;
-    autoDeps.vision = mode === 'online' ? onlineVision : vision;
-    operationStatus = `vision mode: ${mode}`;
-  },
-  onPlayTrajectory: () => {
-    plannedSortTrajectory = null;
-    executionPhase = 'idle';
-    operationStatus = 'demo trajectory';
-    resetTrajectoryLine();
-    player.setWaypoints(createDefaultTrajectory(robot.getJointAngles()));
-    player.play();
+  onDetectionMarkersChanged: (visible) => {
+    rigs.forEach((rig) => {
+      rig.vision.group.visible = visible;
+    });
   },
   onFramesVisibleChanged: (visible) => {
-    robot.setFramesVisible(visible);
+    rigs.forEach((rig) => rig.robot.setFramesVisible(visible));
+    worldAxes.visible = visible;
   },
   onTrajectoryVisibleChanged: (visible) => {
-    trajectoryLine.visible = visible;
+    rigs.forEach((rig) => {
+      rig.trajectoryLine.visible = visible;
+    });
+  },
+  onReset: () => {
+    rigs.forEach((rig) => {
+      rig.player.stop();
+      rig.robot.reset();
+      rig.robot.setGripperOpening(GRIPPER_OPEN_OPENING);
+      rig.planned = null;
+      rig.phase = 'idle';
+      resetTrajectoryLine(rig);
+    });
+    refreshGui();
+  },
+  onHome: () => {
+    rigs.forEach((rig) => {
+      rig.player.stop();
+      rig.robot.home();
+      rig.robot.setGripperOpening(GRIPPER_OPEN_OPENING);
+      rig.planned = null;
+      rig.phase = 'idle';
+      resetTrajectoryLine(rig);
+    });
+    refreshGui();
   },
 });
 
-robot.setFramesVisible(true);
-recordGraspPosition();
-logForwardKinematics();
+rigs.forEach((rig) => {
+  rig.robot.setFramesVisible(false);
+  recordGraspPosition(rig);
+  updateStationScreen(rig);
+});
 animate();
 
 window.addEventListener('resize', onResize);
-renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+// --- frame loop --------------------------------------------------------------------
 
 function animate(): void {
   requestAnimationFrame(animate);
-  const delta = clock.getDelta();
-  station.update(delta);
-  player.update(delta);
-  autoController.tick();
+  const delta = Math.min(clock.getDelta(), 0.1);
+  stepSimulation(delta);
+  updateOrbitCamera(delta);
   controls.update();
   updateDetectionPreview(delta);
   updateHud();
   updateVisionPanel();
-  renderer.render(scene, camera);
+  postPipeline.render();
+}
+
+function stepSimulation(delta: number): void {
+  const dt = delta * speedFactor;
+  mainLine.update(dt);
+  rigs.forEach((rig) => {
+    rig.infeed.update(dt, delta);
+    rig.player.update(dt);
+    rig.partCarrier.position.copy(rig.robot.getGraspPose().position);
+    rig.controller.tick();
+  });
+  effects.update(delta);
+  factory.update(delta);
+}
+
+// Browsers pause requestAnimationFrame in hidden tabs and heavily throttle
+// main-thread timers there; a dedicated-worker timer is exempt, so the
+// production line keeps running while the user is away.
+const HIDDEN_HEARTBEAT_SECONDS = 0.25;
+const heartbeatWorker = new Worker(
+  URL.createObjectURL(
+    new Blob([`setInterval(() => postMessage(0), ${HIDDEN_HEARTBEAT_SECONDS * 1000});`], {
+      type: 'text/javascript',
+    }),
+  ),
+);
+heartbeatWorker.onmessage = () => {
+  if (document.hidden) {
+    clock.getDelta();
+    stepSimulation(HIDDEN_HEARTBEAT_SECONDS);
+    updateDetectionPreview(HIDDEN_HEARTBEAT_SECONDS);
+    updateHud();
+    updateVisionPanel();
+  }
+};
+
+function updateOrbitCamera(delta: number): void {
+  if (!orbitEnabled) {
+    return;
+  }
+  orbitAngle += delta * 0.12;
+  const radius = 7.2;
+  camera.position.set(
+    2.4 + Math.cos(orbitAngle) * radius,
+    3.4,
+    0.6 + Math.sin(orbitAngle) * radius,
+  );
+  camera.lookAt(2.4, 0.45, 0.5);
 }
 
 function onResize(): void {
@@ -283,308 +466,125 @@ function onResize(): void {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  postPipeline.setSize(window.innerWidth, window.innerHeight);
 }
 
-function onPointerDown(event: PointerEvent): void {
-  if (player.isPlaying() || carriedBall) {
-    return;
+// --- pick & place planning (station-local, multi-seed collision-safe IK) -------------
+
+function planAndExecute(rig: StationRig, detection: VisionDetection): 'started' | 'unreachable' {
+  const part = rig.infeed.getPartAtPickStation();
+  const target = rig.infeed.createPickTarget();
+  if (!part || !target) {
+    return 'unreachable';
   }
 
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-
-  const intersections = raycaster.intersectObjects(station.getSelectableMeshes(), false);
-  if (intersections.length === 0) {
-    return;
-  }
-
-  const selected = station.selectBallFromObject(intersections[0].object);
-  plannedSortTrajectory = null;
-  operationStatus = selected ? `selected ${selected.id} (${selected.color})` : 'select a ball';
-  resetTrajectoryLine();
-  refreshGui();
-}
-
-function solveSelectedBallIKDebug(): void {
-  const selected = station.getSelectedBall();
-  if (!selected) {
-    operationStatus = 'no selected ball';
-    return;
-  }
-
-  const target = station.createPlanTarget(selected);
-  const result = solveIK({ position: target.pickPosition }, robot.getJointAngles(), {
-    maxIterations: 160,
-    threshold: 0.012,
-    gain: 0.76,
-    toolOffset: vectorFromTuple(GRIPPER_GRASP_OFFSET),
-  });
-  robot.setJointAngles(result.jointAngles);
-  operationStatus = `IK debug ${result.success ? 'ok' : 'stopped'} error=${result.error.toFixed(3)}m`;
-  refreshGui();
-}
-
-function planSelectedBallSortTrajectory(): void {
-  const selected = station.getSelectedBall();
-  if (!selected) {
-    plannedSortTrajectory = null;
-    operationStatus = 'select a ball before planning';
-    resetTrajectoryLine();
-    return;
-  }
-
-  player.stop();
-  releaseCarriedBall();
-  robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-  const target = station.createPlanTarget(selected);
-  planSortTrajectoryForTarget(target, 'manual');
-}
-
-function runVisionDetection(): void {
-  latestDetections = vision.detectBalls();
-  selectedVisionDetection = latestDetections[0] ?? null;
-  const selected = selectedVisionDetection?.ballId
-    ? station.selectBallById(selectedVisionDetection.ballId)
-    : null;
-  operationStatus = selectedVisionDetection
-    ? `vision detected ${latestDetections.length}; selected ${selectedVisionDetection.ballId}`
-    : 'vision detected no balls';
-  plannedSortTrajectory = null;
-  resetTrajectoryLine();
-  refreshGui();
-  logger.info(operationStatus, selected?.id);
-}
-
-function planFromVisionDetection(): void {
-  if (!selectedVisionDetection) {
-    runVisionDetection();
-  }
-
-  if (!selectedVisionDetection) {
-    operationStatus = 'vision planning failed: no detection';
-    return;
-  }
-
-  const ball = selectedVisionDetection.ballId
-    ? station.getBallById(selectedVisionDetection.ballId)
-    : null;
-  if (!ball) {
-    operationStatus = `vision planning failed: missing ${selectedVisionDetection.ballId}`;
-    return;
-  }
-
-  station.selectBallById(ball.id);
-  player.stop();
-  releaseCarriedBall();
-  robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-  const target = station.createPlanTargetFromPosition(
-    ball,
-    selectedVisionDetection.estimatedWorldPosition.clone(),
+  // Recognition (part type + presence) is online; sanity-check that the vision
+  // estimate agrees with the physical pick station before committing the arm.
+  const horizontalError = Math.hypot(
+    detection.estimatedWorldPosition.x - rig.offsetX - target.pickPosition.x,
+    detection.estimatedWorldPosition.z - target.pickPosition.z,
   );
-  planSortTrajectoryForTarget(target, 'vision');
-}
+  if (horizontalError > VISION_MATCH_RADIUS) {
+    logger.warn(`ST${rig.station + 1}: vision estimate off by ${horizontalError.toFixed(3)}m`);
+    return 'unreachable';
+  }
 
-function autoPlanAndExecute(detection: VisionDetection): 'started' | 'unreachable' {
-  const ball = findNearestBall(detection.estimatedWorldPosition);
-  if (!ball) {
+  rig.player.stop();
+  rig.robot.setGripperOpening(GRIPPER_OPEN_OPENING);
+  planStationTrajectory(rig, target, part);
+  if (!rig.planned) {
     return 'unreachable';
   }
-  station.selectBallById(ball.id);
-  player.stop();
-  releaseCarriedBall();
-  robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-  // Recognition (color + which ball) is online; the grasp uses the matched ball's actual
-  // pose so back-projection error does not cause spurious missed grasps.
-  const target = station.createPlanTarget(ball);
-  planSortTrajectoryForTarget(target, 'vision');
-  if (!plannedSortTrajectory) {
-    return 'unreachable';
-  }
-  executePlannedSortTrajectory();
+  executePlannedTrajectory(rig);
   return 'started';
 }
 
-function findNearestBall(worldPosition: Vector3): SortableBall | null {
-  let nearest: SortableBall | null = null;
-  let nearestDistance = Number.POSITIVE_INFINITY;
-  station.getBalls().forEach((ball) => {
-    if (ball.mesh.parent !== station.group) {
+function planStationTrajectory(
+  rig: StationRig,
+  target: AssemblyPlanTarget,
+  part: AssemblyPart,
+): void {
+  const toolOffset = vectorFromTuple(GRIPPER_GRASP_OFFSET);
+  const startAngles = rig.robot.getJointAngles();
+  const obstacles = rig.obstacles;
+
+  const stages: { position: Vector3; threshold: number; errorCap: number }[] = [
+    { position: target.pickTransitPosition, threshold: 0.025, errorCap: 0.08 },
+    { position: target.prePickPosition, threshold: 0.02, errorCap: 0.08 },
+    { position: target.pickPosition, threshold: 0.014, errorCap: GRASP_ATTACH_TOLERANCE },
+    { position: target.liftPosition, threshold: 0.02, errorCap: 0.08 },
+    { position: target.placeTransitPosition, threshold: 0.025, errorCap: 0.08 },
+    { position: target.dropPosition, threshold: 0.025, errorCap: 0.1 },
+  ];
+  const stageNames = ['过渡点', '预抓取点', '抓取点', '提升点', '装配过渡点', '装配落点'];
+
+  const solutions: IKResult[] = [];
+  let seedAngles = startAngles;
+  for (let stage = 0; stage < stages.length; stage += 1) {
+    const { position, threshold, errorCap } = stages[stage];
+    const result = solveCellSafeIK(position, seedAngles, toolOffset, threshold, obstacles);
+    if (!result || (!result.success && result.error > errorCap)) {
+      failPlanning(rig, `${stageNames[stage]}不可达（碰撞约束）`);
       return;
     }
-    const position = new Vector3();
-    ball.mesh.getWorldPosition(position);
-    const distance = position.distanceTo(worldPosition);
-    if (distance < nearestDistance) {
-      nearestDistance = distance;
-      nearest = ball;
-    }
-  });
-  return nearestDistance <= 0.35 ? nearest : null;
-}
-
-function planSortTrajectoryForTarget(target: SortPlanTarget, source: 'manual' | 'vision'): void {
-  const toolOffset = vectorFromTuple(GRIPPER_GRASP_OFFSET);
-  const startAngles = robot.getJointAngles();
-  const binObstacles = station.getBinObstacles();
-
-  const pickTransitResult = solveGroundSafeIK(
-    target.pickTransitPosition,
-    startAngles,
-    toolOffset,
-    0.025,
-    binObstacles,
-  );
-  if (!pickTransitResult || (!pickTransitResult.success && pickTransitResult.error > 0.08)) {
-    failPlanning('pick transit unreachable without ground/bin collision');
-    return;
+    solutions.push(result);
+    seedAngles = result.jointAngles;
   }
 
-  const safePrePickResult = solveGroundSafeIK(
-    target.prePickPosition,
-    pickTransitResult.jointAngles,
-    toolOffset,
-    0.02,
-    binObstacles,
-  );
-  if (!safePrePickResult || (!safePrePickResult.success && safePrePickResult.error > 0.08)) {
-    failPlanning('pre-pick unreachable without ground/bin collision');
-    return;
-  }
-
-  const pickResult = solveGroundSafeIK(
-    target.pickPosition,
-    safePrePickResult.jointAngles,
-    toolOffset,
-    0.014,
-    binObstacles,
-  );
-  if (!pickResult || (!pickResult.success && pickResult.error > GRASP_ATTACH_TOLERANCE)) {
-    failPlanning('pick unreachable without ground/bin collision');
-    return;
-  }
-
-  const liftResult = solveGroundSafeIK(
-    target.liftPosition,
-    pickResult.jointAngles,
-    toolOffset,
-    0.02,
-    binObstacles,
-  );
-  if (!liftResult || (!liftResult.success && liftResult.error > 0.08)) {
-    failPlanning('lift unreachable without ground/bin collision');
-    return;
-  }
-
-  const placeTransitResult = solveGroundSafeIK(
-    target.placeTransitPosition,
-    liftResult.jointAngles,
-    toolOffset,
-    0.025,
-    binObstacles,
-  );
-  if (!placeTransitResult || (!placeTransitResult.success && placeTransitResult.error > 0.08)) {
-    failPlanning('place transit unreachable without ground/bin collision');
-    return;
-  }
-
-  const dropResult = solveGroundSafeIK(
-    target.dropPosition,
-    placeTransitResult.jointAngles,
-    toolOffset,
-    0.025,
-    binObstacles,
-  );
-  if (!dropResult || (!dropResult.success && dropResult.error > 0.1)) {
-    failPlanning('drop unreachable without ground/bin collision');
-    return;
-  }
-
-  plannedSortTrajectory = {
-    ball: target.ball,
-    pickPosition: target.pickPosition.clone(),
+  const [pickTransit, prePick, pick, lift, placeTransit, drop] = solutions;
+  const planned: PlannedTrajectory = {
+    part,
+    pickPositionLocal: target.pickPosition.clone(),
     pickWaypoints: [
       { time: 0, jointAngles: startAngles },
-      { time: PICK_DURATION_SECONDS * 0.42, jointAngles: pickTransitResult.jointAngles },
-      { time: PICK_DURATION_SECONDS * 0.76, jointAngles: safePrePickResult.jointAngles },
-      { time: PICK_DURATION_SECONDS, jointAngles: pickResult.jointAngles },
+      { time: PICK_DURATION_SECONDS * 0.42, jointAngles: pickTransit.jointAngles },
+      { time: PICK_DURATION_SECONDS * 0.76, jointAngles: prePick.jointAngles },
+      { time: PICK_DURATION_SECONDS, jointAngles: pick.jointAngles },
     ],
     placeWaypoints: [
-      { time: 0, jointAngles: pickResult.jointAngles },
-      { time: PLACE_DURATION_SECONDS * 0.28, jointAngles: liftResult.jointAngles },
-      { time: PLACE_DURATION_SECONDS * 0.68, jointAngles: placeTransitResult.jointAngles },
-      { time: PLACE_DURATION_SECONDS, jointAngles: dropResult.jointAngles },
+      { time: 0, jointAngles: pick.jointAngles },
+      { time: PLACE_DURATION_SECONDS * 0.28, jointAngles: lift.jointAngles },
+      { time: PLACE_DURATION_SECONDS * 0.68, jointAngles: placeTransit.jointAngles },
+      { time: PLACE_DURATION_SECONDS, jointAngles: drop.jointAngles },
     ],
   };
-  plannedSortTrajectory.pickWaypoints = findGroundSafeWaypointRoute(
-    plannedSortTrajectory.pickWaypoints,
-    toolOffset,
-    binObstacles,
-  );
-  plannedSortTrajectory.placeWaypoints = findGroundSafeWaypointRoute(
-    plannedSortTrajectory.placeWaypoints,
-    toolOffset,
-    binObstacles,
-  );
-  const pickClearance = checkTrajectoryGroundClearance(
-    plannedSortTrajectory.pickWaypoints,
-    toolOffset,
-  );
-  const placeClearance = checkTrajectoryGroundClearance(
-    plannedSortTrajectory.placeWaypoints,
-    toolOffset,
-  );
+  planned.pickWaypoints = findSafeWaypointRoute(planned.pickWaypoints, toolOffset, obstacles);
+  planned.placeWaypoints = findSafeWaypointRoute(planned.placeWaypoints, toolOffset, obstacles);
+
+  const pickClearance = checkTrajectoryGroundClearance(planned.pickWaypoints, toolOffset);
+  const placeClearance = checkTrajectoryGroundClearance(planned.placeWaypoints, toolOffset);
   if (!pickClearance.safe || !placeClearance.safe) {
-    const minY = Math.min(pickClearance.minY, placeClearance.minY);
-    failPlanning(`ground collision minY=${minY.toFixed(3)}m`);
+    failPlanning(rig, `轨迹触地风险 minY=${Math.min(pickClearance.minY, placeClearance.minY).toFixed(3)}m`);
     return;
   }
-  const pickObstacle = checkTrajectoryObstacleCollision(
-    plannedSortTrajectory.pickWaypoints,
-    binObstacles,
-    toolOffset,
-  );
-  const placeObstacle = checkTrajectoryObstacleCollision(
-    plannedSortTrajectory.placeWaypoints,
-    binObstacles,
-    toolOffset,
-  );
+  const pickObstacle = checkTrajectoryObstacleCollision(planned.pickWaypoints, obstacles, toolOffset);
+  const placeObstacle = checkTrajectoryObstacleCollision(planned.placeWaypoints, obstacles, toolOffset);
   if (!pickObstacle.safe || !placeObstacle.safe) {
     const collision = !pickObstacle.safe ? pickObstacle : placeObstacle;
-    failPlanning(
-      `bin collision ${collision.obstacleName ?? 'obstacle'} clearance=${collision.minClearance.toFixed(3)}m`,
-    );
+    failPlanning(rig, `设备碰撞 ${collision.obstacleName ?? 'obstacle'}`);
     return;
   }
-  const minClearanceY = Math.min(pickClearance.minY, placeClearance.minY);
-  operationStatus = `planned ${source} ${target.ball.id} -> ${target.ball.targetBin}; minY=${minClearanceY.toFixed(
-    3,
-  )}m`;
-  previewSortTrajectory(plannedSortTrajectory);
-  refreshGui();
-  logger.info(operationStatus);
+
+  rig.planned = planned;
+  previewTrajectory(rig, planned);
+  logger.info(`ST${rig.station + 1}: planned ${part.id}`);
 }
 
-function failPlanning(reason: string): void {
-  plannedSortTrajectory = null;
-  operationStatus = `planning failed: ${reason}`;
-  resetTrajectoryLine();
-  refreshGui();
-  logger.warn(operationStatus);
+function failPlanning(rig: StationRig, reason: string): void {
+  rig.planned = null;
+  resetTrajectoryLine(rig);
+  logger.warn(`ST${rig.station + 1}: 规划失败 ${reason}`);
 }
 
-function solveGroundSafeIK(
+function solveCellSafeIK(
   targetPosition: Vector3,
   currentAngles: number[],
   toolOffset: Vector3,
   threshold: number,
-  obstacles = station.getBinObstacles(),
+  obstacles: StaticObstacle[],
 ): IKResult | null {
-  const seeds = createGroundSafeIkSeeds(currentAngles, targetPosition);
+  const seeds = createIkSeeds(currentAngles, targetPosition);
   let bestSafeResult: IKResult | null = null;
-  let bestUnsafeMinY = Number.POSITIVE_INFINITY;
-  let bestUnsafeObstacleClearance = Number.POSITIVE_INFINITY;
 
   seeds.forEach((seed) => {
     const result = solveIK({ position: targetPosition }, seed, {
@@ -593,17 +593,13 @@ function solveGroundSafeIK(
       gain: 0.74,
       toolOffset,
     });
-    const clearance = checkGroundClearance(result.jointAngles, toolOffset);
-    if (!clearance.safe) {
-      bestUnsafeMinY = Math.min(bestUnsafeMinY, clearance.minY);
+    if (!checkGroundClearance(result.jointAngles, toolOffset).safe) {
       return;
     }
     if (!checkSelfCollision(result.jointAngles, toolOffset).safe) {
       return;
     }
-    const obstacle = checkObstacleCollision(result.jointAngles, obstacles, toolOffset);
-    if (!obstacle.safe) {
-      bestUnsafeObstacleClearance = Math.min(bestUnsafeObstacleClearance, obstacle.minClearance);
+    if (!checkObstacleCollision(result.jointAngles, obstacles, toolOffset).safe) {
       return;
     }
     if (!bestSafeResult || result.error < bestSafeResult.error) {
@@ -611,19 +607,13 @@ function solveGroundSafeIK(
     }
   });
 
-  if (!bestSafeResult && Number.isFinite(bestUnsafeMinY)) {
-    logger.warn(`All IK candidates collide with ground; best minY=${bestUnsafeMinY.toFixed(3)}m`);
-  }
-  if (!bestSafeResult && Number.isFinite(bestUnsafeObstacleClearance)) {
-    logger.warn(
-      `All IK candidates collide with bins; best clearance=${bestUnsafeObstacleClearance.toFixed(3)}m`,
-    );
-  }
   return bestSafeResult;
 }
 
-function createGroundSafeIkSeeds(currentAngles: number[], targetPosition?: Vector3): number[][] {
-  const targetYaw = targetPosition ? Math.atan2(-targetPosition.z, targetPosition.x) : currentAngles[0] ?? 0;
+function createIkSeeds(currentAngles: number[], targetPosition?: Vector3): number[][] {
+  const targetYaw = targetPosition
+    ? Math.atan2(-targetPosition.z, targetPosition.x)
+    : (currentAngles[0] ?? 0);
   const yawCandidates = uniqueRounded([
     currentAngles[0] ?? 0,
     targetYaw,
@@ -663,10 +653,10 @@ function dedupeSeeds(seeds: number[][]): number[][] {
   return [...new Map(seeds.map((seed) => [seed.map((value) => value.toFixed(3)).join(','), seed])).values()];
 }
 
-function findGroundSafeWaypointRoute(
+function findSafeWaypointRoute(
   waypoints: JointWaypoint[],
   toolOffset: Vector3,
-  obstacles = station.getBinObstacles(),
+  obstacles: StaticObstacle[],
 ): JointWaypoint[] {
   const directClearance = checkTrajectoryGroundClearance(waypoints, toolOffset);
   const directObstacle = checkTrajectoryObstacleCollision(waypoints, obstacles, toolOffset);
@@ -675,132 +665,119 @@ function findGroundSafeWaypointRoute(
   }
 
   const start = waypoints[0];
-  const viaHome: JointWaypoint[] = [
-    { time: 0, jointAngles: start.jointAngles },
-    { time: SAFE_HOME_TIME_SECONDS, jointAngles: HOME_POSE },
-    ...waypoints.slice(1).map((waypoint) => ({
-      time: waypoint.time + SAFE_HOME_TIME_SECONDS,
-      jointAngles: waypoint.jointAngles,
-    })),
+  const detours: number[][] = [
+    HOME_POSE,
+    [start.jointAngles[0] ?? 0, -0.9, 1.45, 0, 0.7, 0],
   ];
-  const homeClearance = checkTrajectoryGroundClearance(viaHome, toolOffset);
-  const homeObstacle = checkTrajectoryObstacleCollision(viaHome, obstacles, toolOffset);
-  if (homeClearance.safe && homeObstacle.safe) {
-    return viaHome;
+  for (const detour of detours) {
+    const routed: JointWaypoint[] = [
+      { time: 0, jointAngles: start.jointAngles },
+      { time: SAFE_HOME_TIME_SECONDS, jointAngles: detour },
+      ...waypoints.slice(1).map((waypoint) => ({
+        time: waypoint.time + SAFE_HOME_TIME_SECONDS,
+        jointAngles: waypoint.jointAngles,
+      })),
+    ];
+    if (
+      checkTrajectoryGroundClearance(routed, toolOffset).safe &&
+      checkTrajectoryObstacleCollision(routed, obstacles, toolOffset).safe
+    ) {
+      return routed;
+    }
   }
 
-  const viaLiftedStart: JointWaypoint[] = [
-    start,
-    { time: SAFE_HOME_TIME_SECONDS, jointAngles: [start.jointAngles[0] ?? 0, -0.9, 1.45, 0, 0.7, 0] },
-    ...waypoints.slice(1).map((waypoint) => ({
-      time: waypoint.time + SAFE_HOME_TIME_SECONDS,
-      jointAngles: waypoint.jointAngles,
-    })),
-  ];
-  const liftedClearance = checkTrajectoryGroundClearance(viaLiftedStart, toolOffset);
-  const liftedObstacle = checkTrajectoryObstacleCollision(viaLiftedStart, obstacles, toolOffset);
-  if (liftedClearance.safe && liftedObstacle.safe) {
-    return viaLiftedStart;
-  }
-
-  logger.warn(
-    `No collision-safe route found; direct minY=${directClearance.minY.toFixed(
-      3,
-    )}m bin=${directObstacle.minClearance.toFixed(3)}m, home minY=${homeClearance.minY.toFixed(
-      3,
-    )}m bin=${homeObstacle.minClearance.toFixed(3)}m, lifted minY=${liftedClearance.minY.toFixed(
-      3,
-    )}m bin=${liftedObstacle.minClearance.toFixed(3)}m`,
-  );
+  logger.warn('No collision-safe route found; using direct waypoints');
   return waypoints;
 }
 
-function executePlannedSortTrajectory(): void {
-  if (!plannedSortTrajectory) {
-    operationStatus = 'plan trajectory first';
+// --- execution ------------------------------------------------------------------------
+
+function executePlannedTrajectory(rig: StationRig): void {
+  if (!rig.planned) {
     return;
   }
-
-  robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-  carriedBall = null;
-  executionPhase = 'to-pick';
-  operationStatus = `moving to pick ${plannedSortTrajectory.ball.id}`;
-  resetTrajectoryLine();
-  player.setWaypoints(plannedSortTrajectory.pickWaypoints);
-  player.play();
+  rig.robot.setGripperOpening(GRIPPER_OPEN_OPENING);
+  rig.phase = 'to-pick';
+  resetTrajectoryLine(rig);
+  rig.player.setWaypoints(rig.planned.pickWaypoints);
+  rig.player.play();
   refreshGui();
 }
 
-function handleTrajectoryComplete(): void {
-  if (!plannedSortTrajectory) {
-    executionPhase = 'idle';
+function handleTrajectoryComplete(rig: StationRig): void {
+  if (!rig.planned) {
+    rig.phase = 'idle';
     return;
   }
 
-  if (executionPhase === 'to-pick') {
-    const graspError = robot.getGraspPose().position.distanceTo(plannedSortTrajectory.pickPosition);
+  if (rig.phase === 'to-pick') {
+    const graspWorld = rig.robot.getGraspPose().position;
+    const pickWorld = rig.planned.pickPositionLocal.clone().add(new Vector3(rig.offsetX, 0, 0));
+    const graspError = graspWorld.distanceTo(pickWorld);
     if (graspError > GRASP_ATTACH_TOLERANCE) {
-      robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-      executionPhase = 'idle';
-      plannedSortTrajectory = null;
-      operationStatus = `pick failed error=${graspError.toFixed(3)}m`;
-      refreshGui();
-      autoController.onTrajectoryComplete(false);
+      rig.robot.setGripperOpening(GRIPPER_OPEN_OPENING);
+      rig.phase = 'idle';
+      rig.planned = null;
+      rig.controller.onTrajectoryComplete(false);
       return;
     }
 
-    robot.setGripperOpening(GRIPPER_CLOSED_OPENING);
-    station.attachBallToGripper(
-      plannedSortTrajectory.ball,
-      robot.endEffector,
-      vectorFromTuple(GRIPPER_GRASP_OFFSET),
-    );
-    carriedBall = plannedSortTrajectory.ball;
-    executionPhase = 'to-drop';
-    operationStatus = `carrying ${carriedBall.id} to ${carriedBall.targetBin}`;
-    player.setWaypoints(plannedSortTrajectory.placeWaypoints);
-    player.play();
-    refreshGui();
-    autoController.onTrajectoryComplete(true);
+    const part = rig.infeed.takePartAtPickStation();
+    if (!part) {
+      rig.phase = 'idle';
+      rig.planned = null;
+      rig.controller.onTrajectoryComplete(false);
+      return;
+    }
+    rig.robot.setGripperOpening(part.spec.gripDiameter);
+    rig.partCarrier.add(part.mesh);
+    part.mesh.position.set(0, -part.spec.graspHeight, 0);
+    part.mesh.quaternion.identity();
+    rig.carried = part;
+    rig.phase = 'to-drop';
+    rig.player.setWaypoints(rig.planned.placeWaypoints);
+    rig.player.play();
+    rig.controller.onTrajectoryComplete(true);
     return;
   }
 
-  if (executionPhase === 'to-drop') {
-    releaseCarriedBall();
-    plannedSortTrajectory = null;
-    executionPhase = 'idle';
-    autoController.onTrajectoryComplete(true);
+  if (rig.phase === 'to-drop') {
+    const part = rig.carried ?? rig.planned.part;
+    rig.robot.setGripperOpening(GRIPPER_OPEN_OPENING);
+    rig.carried = null;
+    const placed = mainLine.beginPlace(rig.station, part, () => {
+      effects.spawnFlashRing(mainLine.getStackTopPosition(rig.station), 0x37d3ff);
+      rig.controller.onPlaceSettled();
+    });
+    if (!placed) {
+      // Interlock guarantees a parked carrier; if it is somehow gone, drop the
+      // part back onto the carrier stop so the cycle can recover.
+      logger.warn(`ST${rig.station + 1}: no carrier at release — part re-queued`);
+      rig.controller.onPlaceSettled();
+    }
+    rig.planned = null;
+    rig.phase = 'idle';
   }
 }
 
-function releaseCarriedBall(): void {
-  if (!carriedBall) {
-    robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-    return;
-  }
+// --- trajectory visualization -----------------------------------------------------------
 
-  const releasePosition = robot.getGraspPose().position.clone();
-  station.releaseBallFromGripper(carriedBall, releasePosition);
-  operationStatus = `released ${carriedBall.id} above ${carriedBall.targetBin}`;
-  carriedBall = null;
-  robot.setGripperOpening(GRIPPER_OPEN_OPENING);
-  refreshGui();
+function previewTrajectory(rig: StationRig, plan: PlannedTrajectory): void {
+  rig.trajectoryPositions.length = 0;
+  appendTrajectoryPreview(rig, plan.pickWaypoints);
+  appendTrajectoryPreview(rig, plan.placeWaypoints);
+  updateTrajectoryGeometry(rig);
 }
 
-function previewSortTrajectory(plan: PlannedSortTrajectory): void {
-  trajectoryPositions.length = 0;
-  appendTrajectoryPreview(plan.pickWaypoints);
-  appendTrajectoryPreview(plan.placeWaypoints);
-  updateTrajectoryGeometry();
-}
-
-function appendTrajectoryPreview(waypoints: JointWaypoint[]): void {
+function appendTrajectoryPreview(rig: StationRig, waypoints: JointWaypoint[]): void {
   const duration = waypoints[waypoints.length - 1].time;
   for (let sample = 0; sample <= PLANNED_TRAJECTORY_SAMPLES; sample += 1) {
     const elapsed = (sample / PLANNED_TRAJECTORY_SAMPLES) * duration;
     const jointAngles = sampleJointTrajectory(waypoints, elapsed);
     const graspState = computeVisualChainState(jointAngles, vectorFromTuple(GRIPPER_GRASP_OFFSET));
-    trajectoryPositions.push(graspState.endEffectorPosition.clone());
+    rig.trajectoryPositions.push(
+      graspState.endEffectorPosition.clone().add(new Vector3(rig.offsetX, 0, 0)),
+    );
   }
 }
 
@@ -818,23 +795,23 @@ function sampleJointTrajectory(waypoints: JointWaypoint[], elapsed: number): num
   return lerpAngles(previous.jointAngles, next.jointAngles, t);
 }
 
-function recordGraspPosition(): void {
-  const pose = robot.getGraspPose();
-  const last = trajectoryPositions[trajectoryPositions.length - 1];
+function recordGraspPosition(rig: StationRig): void {
+  const pose = rig.robot.getGraspPose();
+  const last = rig.trajectoryPositions[rig.trajectoryPositions.length - 1];
   if (!last || last.distanceToSquared(pose.position) > 0.00008) {
-    trajectoryPositions.push(pose.position.clone());
-    updateTrajectoryGeometry();
+    rig.trajectoryPositions.push(pose.position.clone());
+    updateTrajectoryGeometry(rig);
   }
 }
 
-function resetTrajectoryLine(): void {
-  trajectoryPositions.length = 0;
-  recordGraspPosition();
+function resetTrajectoryLine(rig: StationRig): void {
+  rig.trajectoryPositions.length = 0;
+  recordGraspPosition(rig);
 }
 
-function updateTrajectoryGeometry(): void {
-  const positionArray = new Float32Array(trajectoryPositions.length * 3);
-  trajectoryPositions.forEach((point, index) => {
+function updateTrajectoryGeometry(rig: StationRig): void {
+  const positionArray = new Float32Array(rig.trajectoryPositions.length * 3);
+  rig.trajectoryPositions.forEach((point, index) => {
     positionArray[index * 3] = point.x;
     positionArray[index * 3 + 1] = point.y;
     positionArray[index * 3 + 2] = point.z;
@@ -842,78 +819,71 @@ function updateTrajectoryGeometry(): void {
 
   const nextGeometry = new BufferGeometry();
   nextGeometry.setAttribute('position', new Float32BufferAttribute(positionArray, 3));
-  trajectoryLine.geometry.dispose();
-  trajectoryLine.geometry = nextGeometry;
-  trajectoryGeometry = nextGeometry;
+  rig.trajectoryLine.geometry.dispose();
+  rig.trajectoryLine.geometry = nextGeometry;
 }
 
 function refreshGui(): void {
   gui?.refreshJointAngles();
 }
 
-function logForwardKinematics(): void {
-  const fkPose = forwardKinematics(robot.getJointAngles());
-  logger.info(`FK position: ${formatVector(fkPose.position)}`);
-}
+// --- HUD & vision panel -------------------------------------------------------------------
 
 function updateHud(): void {
-  const visualPose = robot.getEndEffectorPose();
-  const fkPose = forwardKinematics(robot.getJointAngles());
-  const dhPose = forwardKinematicsDH(robot.getJointAngles());
-  const orientation = visualPose.orientation;
+  const takt = mainLine.getAvgTaktSeconds();
+  const stationLines = rigs.map(
+    (rig) =>
+      `ST${rig.station + 1} ${PART_SPECS[rig.partType].label}: ${translateState(rig.state)} — ${rig.status}`,
+  );
   hud.innerHTML = [
-    '<strong>Vision Sorting Station</strong>',
-    `Mode: ${visionMode} | Auto: ${autoState} — ${autoStatus}`,
-    formatAutoReport(),
-    `Selected: ${station.getStatusLabel()}`,
-    `Operation: ${operationStatus}`,
-    `Vision: ${formatVisionStatus()}`,
-    `Gripper opening: ${robot.getGripperOpening().toFixed(3)} m`,
-    `Visual EE position: ${formatVector(visualPose.position)} m`,
-    `FK position: ${formatVector(fkPose.position)} m`,
-    `DH interface: ${formatVector(dhPose.position)} m`,
-    `EE quaternion: ${formatQuaternion(orientation)}`,
-    `Trajectory: ${player.isPlaying() ? executionPhase : 'idle'} | samples: ${trajectoryPositions.length}`,
+    '<strong>轮毂装配线 LINE-01 · 三机协同</strong>',
+    `产线: ${lineRunning ? '运行中' : '停止'} | 产量: ${mainLine.getOutputCount()} 台 | 在制: ${mainLine.getWipCount()} 托架`,
+    `节拍: ${takt !== null ? `${takt.toFixed(1)}s/台` : '—'}`,
+    lineReportLine ?? '班报: —',
+    ...stationLines,
   ].join('<br />');
 }
 
-function formatAutoReport(): string {
-  if (!latestReport) {
-    return 'Report: —';
-  }
-  const skips = latestReport.skipped
-    .map((decision) => `${decision.detection.ballId ?? 'ball'}:${decision.skipReason}`)
-    .join(', ');
-  const blind = latestReport.endedBlind ? ' [blind halt]' : '';
-  return `Report: ${latestReport.sortedCount}/${latestReport.totalSeen} sorted${blind}; skipped: ${skips || 'none'}`;
+function translateState(state: StationState): string {
+  const names: Record<StationState, string> = {
+    idle: '待机',
+    waiting: '待料',
+    observing: '视觉识别',
+    planning: '轨迹规划',
+    picking: '抓取',
+    placing: '装配',
+    fastening: '拧紧',
+    blind: '视觉故障',
+    done: '已停止',
+  };
+  return names[state];
 }
 
-function formatVisionStatus(): string {
-  if (!selectedVisionDetection) {
-    return `${latestDetections.length} detections`;
-  }
-  const detectionLabel = selectedVisionDetection.ballId ?? selectedVisionDetection.color;
-  return `${latestDetections.length} detections, ${detectionLabel} px=${selectedVisionDetection.pixel.x.toFixed(
-    0,
-  )},${selectedVisionDetection.pixel.y.toFixed(0)} conf=${selectedVisionDetection.confidence.toFixed(2)}`;
+function composeLineReport(): void {
+  const takt = mainLine.getAvgTaktSeconds();
+  const rejects = rigs.reduce((sum, rig) => sum + rig.controller.getRejectCount(), 0);
+  const placed = rigs.reduce((sum, rig) => sum + rig.controller.getPartsPlaced(), 0);
+  lineReportLine = `班报: 下线 ${mainLine.getOutputCount()} 台 / 装配 ${placed} 件, 节拍 ${
+    takt !== null ? `${takt.toFixed(1)}s` : '—'
+  }, 退料 ${rejects}`;
 }
 
 function updateVisionPanel(): void {
-  const rows = latestOnlineDetections
-    .slice(0, 10)
-    .map(
-      (detection, index) =>
-        `<div class="vision-row ${detection === selectedVisionDetection ? 'active' : ''}">
+  const rows = latestDetections
+    .slice(0, 8)
+    .map((detection, index) => {
+      const partLabel = PART_SPECS[PART_TYPE_BY_MARKER[detection.color]].label;
+      return `<div class="vision-row">
           <span>D${index + 1}</span>
-          <span>${detection.color}</span>
+          <span>${partLabel}</span>
           <span>${detection.pixel.x.toFixed(0)},${detection.pixel.y.toFixed(0)}</span>
           <span>${formatVector(detection.estimatedWorldPosition, 2)}</span>
-        </div>`,
-    )
+        </div>`;
+    })
     .join('');
   visionTableElement.innerHTML = [
-    '<div class="vision-head"><span>ID</span><span>Color</span><span>Pixel</span><span>World</span></div>',
-    rows || '<div class="vision-empty">No balls detected in the live frame</div>',
+    '<div class="vision-head"><span>ID</span><span>零件</span><span>像素</span><span>世界坐标</span></div>',
+    rows || '<div class="vision-empty">当前画面中未识别到零件标识</div>',
   ].join('');
 }
 
@@ -924,12 +894,9 @@ function updateDetectionPreview(deltaSeconds: number): void {
   }
   visionPreviewElapsed = 0;
 
-  const frame = onlineVision.observe();
-  latestOnlineDetections = frame.isObservable ? onlineVision.detectVisibleBalls(frame) : [];
-  if (visionMode === 'online') {
-    latestDetections = latestOnlineDetections;
-    selectedVisionDetection = latestOnlineDetections[0] ?? null;
-  }
+  const vision = rigs[previewStation]?.vision ?? rigs[0].vision;
+  const frame = vision.observe();
+  latestDetections = frame.isObservable ? vision.detectAll(frame) : [];
 
   const context = visionDetectionContext;
   const width = visionDetectionCanvas.width;
@@ -953,12 +920,12 @@ function updateDetectionPreview(deltaSeconds: number): void {
     context.stroke();
   }
 
-  latestOnlineDetections.forEach((detection) => {
+  latestDetections.forEach((detection) => {
     const x = (detection.pixel.x / frame.width) * width;
     const y = (1 - detection.pixel.y / frame.height) * height;
     const pixelScale = (width / frame.width + height / frame.height) / 2;
     const radius = Math.max(6, Math.min(18, Math.sqrt(detection.areaPx / Math.PI) * pixelScale));
-    const color = detection.color === 'red' ? '#ff3f4b' : '#337cff';
+    const color = DETECTION_DRAW_COLORS[detection.color];
 
     context.fillStyle = color;
     context.globalAlpha = 0.82;
@@ -983,7 +950,9 @@ function updateDetectionPreview(deltaSeconds: number): void {
   context.fillStyle = frame.isObservable ? '#65e6a5' : '#ff7272';
   context.font = '600 11px system-ui, sans-serif';
   context.fillText(
-    frame.isObservable ? `LIVE ONLINE | ${latestOnlineDetections.length} DETECTED` : 'CAMERA VIEW BLOCKED',
+    frame.isObservable
+      ? `ST${previewStation + 1} LIVE | ${latestDetections.length} 个零件标识`
+      : '相机视野被遮挡',
     10,
     17,
   );
@@ -995,10 +964,4 @@ function getCanvas2DContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D
     throw new Error('Unable to create vision detection canvas');
   }
   return context;
-}
-
-function formatQuaternion(quaternion: Quaternion): string {
-  return `${quaternion.x.toFixed(3)}, ${quaternion.y.toFixed(3)}, ${quaternion.z.toFixed(
-    3,
-  )}, ${quaternion.w.toFixed(3)}`;
 }

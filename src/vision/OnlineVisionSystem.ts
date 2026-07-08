@@ -13,39 +13,41 @@ import {
   type WebGLRenderer,
   WebGLRenderTarget,
 } from 'three';
-import type { BallColor } from '../sorting/SortingStation';
-import type { VisionDetection, VisionFrame, VisionSystem } from './VisionSystem';
-import { configureStationVisionCamera } from './cameraConfig';
+import { MARKER_PLANE_Y, type DetectionRegion } from '../assembly/layout';
+import type { DetectionColor, VisionDetection, VisionFrame, VisionSystem } from './VisionSystem';
 import { detectBlobs, usablePixelRatio } from './imageProcessing';
 
-const CAPTURE_WIDTH = 240;
-const CAPTURE_HEIGHT = 180;
-/** Approximate height of a ball center resting on the staging-bin floor. */
-const BALL_PLANE_Y = 0.24;
-/** Below this lit-pixel ratio the view is treated as obstructed/unreadable (FR-008). */
+const CAPTURE_WIDTH = 320;
+const CAPTURE_HEIGHT = 240;
+/** Below this lit-pixel ratio the view is treated as obstructed/unreadable. */
 const OBSERVABLE_RATIO_FLOOR = 0.1;
-interface DetectionRegion {
-  minX: number;
-  maxX: number;
-  minZ: number;
-  maxZ: number;
+
+const MARKER_RING_COLORS: Record<DetectionColor, number> = {
+  red: 0xff6b6b,
+  blue: 0x6b9bff,
+  yellow: 0xffd166,
+};
+
+export interface VisionRigConfig {
+  name: string;
+  fov: number;
+  /** Fixed camera pose, in world coordinates. */
+  position: Vector3;
+  target: Vector3;
+  /** World-coordinate windows the detections are filtered against. */
+  pickRegion: DetectionRegion;
+  cellRegion: DetectionRegion;
 }
 
-/** Only balls in the gray source bin are actionable by the sorting controller. */
-const PICK_REGION = { minX: 0.85, maxX: 1.62, minZ: -0.45, maxZ: 0.45 };
-/** The operator preview tracks balls across the source and both destination bins. */
-const STATION_REGION = { minX: 0.78, maxX: 1.68, minZ: -1.08, maxZ: 1.08 };
-
 /**
- * Genuine online recognition: renders the fixed front camera to an offscreen target,
- * reads the pixels back, and recovers ball color + position from the image alone.
- * It never reads ball world positions or colors (see contracts/vision-system.md VS-1).
+ * Genuine online recognition: renders a fixed station camera to an offscreen
+ * target, reads the pixels back, and recovers part-marker color + position from
+ * the image alone. It never reads part world positions or types.
  */
 export class OnlineVisionSystem implements VisionSystem {
-  readonly mode = 'online' as const;
-  readonly camera = new PerspectiveCamera(50, CAPTURE_WIDTH / CAPTURE_HEIGHT, 0.05, 8);
+  readonly camera: PerspectiveCamera;
   readonly group = new Group();
-  /** Scene objects (other vision rigs, overlays) hidden while capturing the frame. */
+  /** Scene objects (overlays, effects) hidden while capturing the frame. */
   hideDuringCapture: Object3D[] = [];
 
   private readonly detectionMarkers = new Group();
@@ -56,12 +58,17 @@ export class OnlineVisionSystem implements VisionSystem {
   constructor(
     private readonly renderer: WebGLRenderer,
     private readonly scene: Scene,
+    private readonly config: VisionRigConfig,
   ) {
-    this.camera.name = 'Online front vision camera';
-    configureStationVisionCamera(this.camera);
+    this.camera = new PerspectiveCamera(config.fov, CAPTURE_WIDTH / CAPTURE_HEIGHT, 0.05, 12);
+    this.camera.name = config.name;
+    this.camera.position.copy(config.position);
+    this.camera.lookAt(config.target);
+    this.camera.updateMatrixWorld(true);
+    this.camera.updateProjectionMatrix();
 
-    this.detectionMarkers.name = 'Online vision detection markers';
-    this.group.name = 'Online vision';
+    this.detectionMarkers.name = `${config.name} detection markers`;
+    this.group.name = config.name;
     this.group.add(this.detectionMarkers);
 
     this.renderTarget = new WebGLRenderTarget(CAPTURE_WIDTH, CAPTURE_HEIGHT);
@@ -96,12 +103,12 @@ export class OnlineVisionSystem implements VisionSystem {
     };
   }
 
-  detectBalls(frame: VisionFrame): VisionDetection[] {
-    return this.detectInRegion(frame, PICK_REGION);
+  detectPickable(frame: VisionFrame): VisionDetection[] {
+    return this.detectInRegion(frame, this.config.pickRegion);
   }
 
-  detectVisibleBalls(frame: VisionFrame): VisionDetection[] {
-    return this.detectInRegion(frame, STATION_REGION);
+  detectAll(frame: VisionFrame): VisionDetection[] {
+    return this.detectInRegion(frame, this.config.cellRegion);
   }
 
   private detectInRegion(frame: VisionFrame, region: DetectionRegion): VisionDetection[] {
@@ -124,7 +131,6 @@ export class OnlineVisionSystem implements VisionSystem {
       }
       this.addDetectionMarker(world, blob.color);
       detections.push({
-        ballId: null,
         color: blob.color,
         pixel: new Vector2(blob.centroidX, blob.centroidY),
         estimatedWorldPosition: world,
@@ -140,7 +146,7 @@ export class OnlineVisionSystem implements VisionSystem {
     this.raycaster.setFromCamera(new Vector2(ndcX, ndcY), this.camera);
     const origin = this.raycaster.ray.origin;
     const direction = this.raycaster.ray.direction;
-    const t = (BALL_PLANE_Y - origin.y) / direction.y;
+    const t = (MARKER_PLANE_Y - origin.y) / direction.y;
     return origin.clone().add(direction.clone().multiplyScalar(t));
   }
 
@@ -157,17 +163,17 @@ export class OnlineVisionSystem implements VisionSystem {
     };
   }
 
-  private addDetectionMarker(position: Vector3, color: BallColor): void {
+  private addDetectionMarker(position: Vector3, color: DetectionColor): void {
     const marker = new Mesh(
       new RingGeometry(0.07, 0.082, 32),
       new MeshBasicMaterial({
-        color: color === 'red' ? 0xff6b6b : 0x6b9bff,
+        color: MARKER_RING_COLORS[color],
         transparent: true,
         opacity: 0.92,
       }),
     );
     marker.position.copy(position);
-    marker.position.y += 0.1;
+    marker.position.y += 0.12;
     marker.rotation.x = -Math.PI / 2;
     this.detectionMarkers.add(marker);
   }

@@ -42,6 +42,12 @@ describe('rgbToHsv / classifyPixel', () => {
     const [h] = rgbToHsv(255, 0, 0);
     expect(h).toBeCloseTo(0, 5);
   });
+
+  it('classifies the yellow nut fiducial and brass tones as yellow', () => {
+    expect(classifyPixel(255, 214, 10)).toBe('yellow'); // marker 0xffd60a
+    expect(classifyPixel(201, 162, 63)).toBe('yellow'); // brass body
+    expect(classifyPixel(255, 120, 20)).toBe('background'); // orange stays out
+  });
 });
 
 describe('detectBlobs', () => {
@@ -72,7 +78,7 @@ describe('detectBlobs', () => {
 
   it('scenario 3: a desaturated blob is detected but with low confidence', () => {
     const buffer = makeBuffer();
-    fillRect(buffer, 12, 10, 24, 22, 200, 120, 120);
+    fillRect(buffer, 12, 10, 24, 22, 220, 105, 105);
 
     const blobs = detectBlobs(buffer, WIDTH, HEIGHT);
     expect(blobs).toHaveLength(1);
@@ -89,6 +95,19 @@ describe('detectBlobs', () => {
     expect(blobs).toHaveLength(2);
     expect(blobs.every((blob) => blob.color === 'red')).toBe(true);
     expect(blobs.reduce((sum, blob) => sum + blob.areaPx, 0)).toBe(24 * 12);
+  });
+
+  it('detects all three marker classes in one frame', () => {
+    const buffer = makeBuffer();
+    fillRect(buffer, 2, 2, 10, 10, 255, 30, 30);
+    fillRect(buffer, 18, 2, 26, 10, 40, 70, 255);
+    fillRect(buffer, 34, 2, 42, 10, 255, 214, 10);
+
+    const blobs = detectBlobs(buffer, WIDTH, HEIGHT);
+    expect(blobs).toHaveLength(3);
+    expect(new Set(blobs.map((blob) => blob.color))).toEqual(new Set(['red', 'blue', 'yellow']));
+    const yellow = blobs.find((blob) => blob.color === 'yellow');
+    expect(yellow?.confidence ?? 0).toBeGreaterThan(0.6);
   });
 
   it('scenario 5: an all-black buffer yields no blobs and ~0 usable ratio', () => {

@@ -1,13 +1,14 @@
 /**
  * Pure (no three.js / DOM) image analysis for the online vision path.
- * Operates on an RGBA byte buffer and recovers red/blue ball blobs by HSV color
- * segmentation + connected-component labeling. See research.md R2/R3.
+ * Operates on an RGBA byte buffer and recovers part-marker blobs (red / blue /
+ * yellow fiducials) by HSV color segmentation + connected-component labeling.
  */
 
-export type PixelColor = 'red' | 'blue' | 'background';
+export type MarkerColor = 'red' | 'blue' | 'yellow';
+export type PixelColor = MarkerColor | 'background';
 
 export interface BlobDetection {
-  color: 'red' | 'blue';
+  color: MarkerColor;
   /** Centroid in buffer coordinates: x from left, y by row index (as supplied). */
   centroidX: number;
   centroidY: number;
@@ -27,7 +28,9 @@ export interface BlobOptions {
 
 export const DEFAULT_BLOB_OPTIONS: BlobOptions = {
   minArea: 8,
-  minSaturation: 0.3,
+  // Part fiducials are near-fully saturated; a high floor rejects painted/lit
+  // equipment surfaces that pick up tint from the cool factory lighting.
+  minSaturation: 0.45,
   minValue: 0.2,
 };
 
@@ -76,16 +79,24 @@ export function classifyPixel(
   if (h <= 25 || h >= 335) {
     return 'red';
   }
+  if (h >= 40 && h <= 75) {
+    return 'yellow';
+  }
   if (h >= 200 && h <= 260) {
     return 'blue';
   }
   return 'background';
 }
 
+/** Nominal hue center per marker class, for purity scoring. */
+const HUE_CENTER: Record<MarkerColor, number> = { red: 0, blue: 220, yellow: 57 };
+
 /** Per-pixel hue/saturation purity in [0,1] for the given color class. */
-function pixelPurity(h: number, s: number, v: number, color: 'red' | 'blue'): number {
+function pixelPurity(h: number, s: number, v: number, color: MarkerColor): number {
   const hueDist =
-    color === 'red' ? Math.min(Math.abs(h - 0), Math.abs(h - 360)) : Math.abs(h - 220);
+    color === 'red'
+      ? Math.min(Math.abs(h - 0), Math.abs(h - 360))
+      : Math.abs(h - HUE_CENTER[color]);
   const hueScore = clamp01(1 - hueDist / 60);
   return clamp01(s) * hueScore * clamp01(v * 1.5);
 }
@@ -106,7 +117,7 @@ export function usablePixelRatio(pixels: Uint8Array, width: number, height: numb
   return lit / total;
 }
 
-/** Detect red/blue blobs via 4-connectivity connected components. */
+/** Detect marker blobs (red/blue/yellow) via 4-connectivity connected components. */
 export function detectBlobs(
   pixels: Uint8Array,
   width: number,
@@ -158,12 +169,12 @@ export function detectBlobs(
 }
 
 /**
- * Touching balls of the same color form one component. Their union is elongated,
+ * Touching markers of the same color form one component. Their union is elongated,
  * so split it along its PCA major axis into approximately circular sub-components.
  */
 function splitElongatedComponent(
   pixels: ComponentPixel[],
-  color: 'red' | 'blue',
+  color: MarkerColor,
   minArea: number,
 ): BlobDetection[] {
   const meanX = pixels.reduce((sum, pixel) => sum + pixel.x, 0) / pixels.length;
@@ -224,7 +235,7 @@ function splitElongatedComponent(
   return buckets.map((bucket) => createBlob(bucket, color));
 }
 
-function createBlob(pixels: ComponentPixel[], color: 'red' | 'blue'): BlobDetection {
+function createBlob(pixels: ComponentPixel[], color: MarkerColor): BlobDetection {
   const areaPx = pixels.length;
   return {
     color,
@@ -240,7 +251,7 @@ function pushNeighbor(
   labels: Int32Array,
   pixels: Uint8Array,
   options: BlobOptions,
-  color: 'red' | 'blue',
+  color: MarkerColor,
   x: number,
   y: number,
   width: number,

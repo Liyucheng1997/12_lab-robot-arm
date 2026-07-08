@@ -6,23 +6,30 @@ import {
   checkSelfCollision,
   checkTrajectoryGroundClearance,
   checkTrajectoryObstacleCollision,
+  type StaticObstacle,
 } from '../../src/robot/collision';
 import { solveIK } from '../../src/robot/kinematics';
 import { GRIPPER_GRASP_OFFSET, HOME_POSE, ZERO_POSE } from '../../src/robot/limits';
-import { SortingStation, type SortPlanTarget } from '../../src/sorting/SortingStation';
+import {
+  ASSEMBLY_SEQUENCE,
+  STATION_COUNT,
+  createAssemblyPlanTarget,
+  obstaclesForStation,
+  type AssemblyPlanTarget,
+} from '../../src/assembly/layout';
 import type { IKResult, JointWaypoint } from '../../src/types/robot';
 import { vectorFromTuple } from '../../src/utils/math';
 
 const TOOL = vectorFromTuple(GRIPPER_GRASP_OFFSET);
 const SAFE_HOME_TIME_SECONDS = 1.25;
+/** Set per test case: the local-frame obstacle set of the station under test. */
+let OBSTACLES: StaticObstacle[] = [];
 
-function solveStationSafeIK(
-  station: SortingStation,
+function solveCellSafeIK(
   targetPosition: Vector3,
   currentAngles: number[],
   threshold: number,
 ): IKResult | null {
-  const obstacles = station.getBinObstacles();
   const seeds = createSeeds(currentAngles, targetPosition);
   let best: IKResult | null = null;
 
@@ -39,7 +46,7 @@ function solveStationSafeIK(
     if (!checkSelfCollision(result.jointAngles, TOOL).safe) {
       return;
     }
-    if (!checkObstacleCollision(result.jointAngles, obstacles, TOOL).safe) {
+    if (!checkObstacleCollision(result.jointAngles, OBSTACLES, TOOL).safe) {
       return;
     }
     if (!best || result.error < best.error) {
@@ -50,81 +57,60 @@ function solveStationSafeIK(
   return best;
 }
 
-function findPlanFailure(station: SortingStation, target: SortPlanTarget): string | null {
-  const pickTransit = solveStationSafeIK(station, target.pickTransitPosition, HOME_POSE, 0.025);
+function findPlanFailure(target: AssemblyPlanTarget): string | null {
+  const pickTransit = solveCellSafeIK(target.pickTransitPosition, HOME_POSE, 0.025);
   if (!pickTransit || (!pickTransit.success && pickTransit.error > 0.08)) {
     return 'pick-transit';
   }
 
-  const prePick = solveStationSafeIK(
-    station,
-    target.prePickPosition,
-    pickTransit.jointAngles,
-    0.02,
-  );
+  const prePick = solveCellSafeIK(target.prePickPosition, pickTransit.jointAngles, 0.02);
   if (!prePick || (!prePick.success && prePick.error > 0.08)) {
     return 'pre-pick';
   }
 
-  const pick = solveStationSafeIK(station, target.pickPosition, prePick.jointAngles, 0.014);
+  const pick = solveCellSafeIK(target.pickPosition, prePick.jointAngles, 0.014);
   if (!pick || (!pick.success && pick.error > 0.05)) {
     return 'pick';
   }
 
-  const lift = solveStationSafeIK(station, target.liftPosition, pick.jointAngles, 0.02);
+  const lift = solveCellSafeIK(target.liftPosition, pick.jointAngles, 0.02);
   if (!lift || (!lift.success && lift.error > 0.08)) {
     return 'lift';
   }
 
-  const placeTransit = solveStationSafeIK(
-    station,
-    target.placeTransitPosition,
-    lift.jointAngles,
-    0.025,
-  );
+  const placeTransit = solveCellSafeIK(target.placeTransitPosition, lift.jointAngles, 0.025);
   if (!placeTransit || (!placeTransit.success && placeTransit.error > 0.08)) {
     return 'place-transit';
   }
 
-  const drop = solveStationSafeIK(
-    station,
-    target.dropPosition,
-    placeTransit.jointAngles,
-    0.025,
-  );
+  const drop = solveCellSafeIK(target.dropPosition, placeTransit.jointAngles, 0.025);
   if (!drop || (!drop.success && drop.error > 0.1)) {
     return 'drop';
   }
 
-  const pickWaypoints = findSafeRoute(
-    station,
-    [
-      { time: 0, jointAngles: HOME_POSE },
-      { time: 1.3, jointAngles: pickTransit.jointAngles },
-      { time: 2.3, jointAngles: prePick.jointAngles },
-      { time: 3, jointAngles: pick.jointAngles },
-    ],
-  );
-  const placeWaypoints = findSafeRoute(
-    station,
-    [
-      { time: 0, jointAngles: pick.jointAngles },
-      { time: 1.1, jointAngles: lift.jointAngles },
-      { time: 2.7, jointAngles: placeTransit.jointAngles },
-      { time: 4, jointAngles: drop.jointAngles },
-    ],
-  );
+  const pickWaypoints = findSafeRoute([
+    { time: 0, jointAngles: HOME_POSE },
+    { time: 1.3, jointAngles: pickTransit.jointAngles },
+    { time: 2.3, jointAngles: prePick.jointAngles },
+    { time: 3, jointAngles: pick.jointAngles },
+  ]);
+  const placeWaypoints = findSafeRoute([
+    { time: 0, jointAngles: pick.jointAngles },
+    { time: 1.1, jointAngles: lift.jointAngles },
+    { time: 2.7, jointAngles: placeTransit.jointAngles },
+    { time: 4, jointAngles: drop.jointAngles },
+  ]);
 
-  const pickFailure = trajectoryFailure(station, pickWaypoints);
+  const pickFailure = trajectoryFailure(pickWaypoints);
   if (pickFailure) {
     return `pick-${pickFailure}`;
   }
-  const placeFailure = trajectoryFailure(station, placeWaypoints);
+  const placeFailure = trajectoryFailure(placeWaypoints);
   return placeFailure ? `place-${placeFailure}` : null;
 }
 
-function findSafeRoute(station: SortingStation, waypoints: JointWaypoint[]): JointWaypoint[] {
-  if (isTrajectorySafe(station, waypoints)) {
+function findSafeRoute(waypoints: JointWaypoint[]): JointWaypoint[] {
+  if (trajectoryFailure(waypoints) === null) {
     return waypoints;
   }
 
@@ -132,7 +118,7 @@ function findSafeRoute(station: SortingStation, waypoints: JointWaypoint[]): Joi
   const end = waypoints.at(-1) ?? start;
   for (const candidate of createRouteCandidates(start.jointAngles, end.jointAngles)) {
     const routed = addRouteWaypoint(waypoints, candidate);
-    if (isTrajectorySafe(station, routed)) {
+    if (trajectoryFailure(routed) === null) {
       return routed;
     }
   }
@@ -166,16 +152,14 @@ function addRouteWaypoint(waypoints: JointWaypoint[], jointAngles: number[]): Jo
   ];
 }
 
-function isTrajectorySafe(station: SortingStation, waypoints: JointWaypoint[]): boolean {
-  return trajectoryFailure(station, waypoints) === null;
-}
-
-function trajectoryFailure(station: SortingStation, waypoints: JointWaypoint[]): string | null {
-  if (!checkTrajectoryGroundClearance(waypoints, TOOL).safe) {
-    return 'ground';
+function trajectoryFailure(waypoints: JointWaypoint[]): string | null {
+  const ground = checkTrajectoryGroundClearance(waypoints, TOOL);
+  if (!ground.safe) {
+    return `ground(minY=${ground.minY.toFixed(3)})`;
   }
-  if (!checkTrajectoryObstacleCollision(waypoints, station.getBinObstacles(), TOOL).safe) {
-    return 'obstacle';
+  const obstacle = checkTrajectoryObstacleCollision(waypoints, OBSTACLES, TOOL);
+  if (!obstacle.safe) {
+    return `obstacle:${obstacle.obstacleName}(clearance=${obstacle.minClearance.toFixed(3)})`;
   }
   return null;
 }
@@ -216,36 +200,33 @@ function uniqueRounded(values: number[]): number[] {
   return [...new Map(values.map((value) => [value.toFixed(3), value])).values()];
 }
 
-describe('sorting station reachability', () => {
-  it('can plan a collision-safe pick and place for every initial ball', () => {
-    const station = new SortingStation();
-    const unreachable = station
-      .getBalls()
-      .map((ball) => station.createPlanTarget(ball))
-      .map((target) => ({
-        id: target.ball.id,
-        reason: findPlanFailure(station, target),
-      }))
-      .filter((failure) => failure.reason);
+describe('assembly line reachability', () => {
+  // Each station reuses the same LOCAL pick/place geometry, but its obstacle
+  // set differs (neighbor stations, robot columns, the main line), so every
+  // station is verified against its own translated obstacle field.
+  for (let station = 0; station < STATION_COUNT; station += 1) {
+    const type = ASSEMBLY_SEQUENCE[station];
+    it(`station ${station + 1} can pick ${type} and place it collision-free`, () => {
+      OBSTACLES = obstaclesForStation(station);
+      const reason = findPlanFailure(createAssemblyPlanTarget(type));
+      expect(reason).toBeNull();
+    });
+  }
 
-    expect(unreachable).toEqual([]);
-  });
-
-  it('can plan a collision-safe pick and place after the balls settle', () => {
-    const station = new SortingStation();
-    for (let step = 0; step < 300; step += 1) {
-      station.update(1 / 60);
+  it('keeps the drop points above every obstacle in their footprint', () => {
+    for (let station = 0; station < STATION_COUNT; station += 1) {
+      const target = createAssemblyPlanTarget(ASSEMBLY_SEQUENCE[station]);
+      obstaclesForStation(station).forEach((obstacle: StaticObstacle) => {
+        const { box } = obstacle;
+        const inFootprint =
+          target.dropPosition.x >= box.min.x - 0.02 &&
+          target.dropPosition.x <= box.max.x + 0.02 &&
+          target.dropPosition.z >= box.min.z - 0.02 &&
+          target.dropPosition.z <= box.max.z + 0.02;
+        if (inFootprint) {
+          expect(target.dropPosition.y).toBeGreaterThan(box.max.y);
+        }
+      });
     }
-
-    const unreachable = station
-      .getBalls()
-      .map((ball) => station.createPlanTarget(ball))
-      .map((target) => ({
-        id: target.ball.id,
-        reason: findPlanFailure(station, target),
-      }))
-      .filter((failure) => failure.reason);
-
-    expect(unreachable).toEqual([]);
   });
 });
